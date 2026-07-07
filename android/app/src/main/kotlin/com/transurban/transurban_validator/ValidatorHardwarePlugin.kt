@@ -97,6 +97,29 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
     // logcat) can show WHERE it fails on the real WizarPOS device.
     @Volatile private var rfDiag: String = "not started"
 
+    // Rolling trace buffer of the last RF operations. Every native step
+    // (resolve/open/waitForCardPresent/resultCode/getCard/searchEnd) appends a
+    // timestamped line here so the Flutter UI can show a live on-screen log the
+    // user can screenshot — no adb needed to debug on the real device.
+    private val rfTrace = java.util.ArrayDeque<String>()
+    private val traceLock = Object()
+    // Monotonic counter so we can see how many reads have happened + which one
+    // stopped working ("read #1 ok, read #2 timeout").
+    @Volatile private var readSeq = 0
+
+    private fun trace(msg: String) {
+        val line = "${System.currentTimeMillis() % 100000}ms  $msg"
+        Log.i(TAG, "TRACE $line")
+        synchronized(traceLock) {
+            rfTrace.addLast(line)
+            while (rfTrace.size > 60) rfTrace.removeFirst()
+        }
+    }
+
+    private fun traceDump(): String = synchronized(traceLock) {
+        if (rfTrace.isEmpty()) "(no trace yet)" else rfTrace.joinToString("\n")
+    }
+
     // ---- FlutterPlugin ----
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         appContext = binding.applicationContext
@@ -152,6 +175,17 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
                 // state (device found? opened ok?) without needing a card.
                 synchronized(rfLock) { ensureRfDevice() }
                 val d = rfDiag
+                main.post { result.success(d) }
+            }
+            "nfcTrace" -> io.execute {
+                // Return the rolling on-screen log of native RF steps.
+                val d = traceDump()
+                main.post { result.success(d) }
+            }
+            "nfcMethods" -> io.execute {
+                // List which native RF methods actually exist on THIS device's
+                // SDK build, so we stop guessing what primitives are available.
+                val d = listRfMethods()
                 main.post { result.success(d) }
             }
             else -> result.notImplemented()
@@ -259,8 +293,9 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
             // Already-open is benign — keep the handle.
             try {
                 deviceCls.getMethod("open").invoke(device)
+                trace("open() ok")
             } catch (e: java.lang.reflect.InvocationTargetException) {
-                Log.d(TAG, "rf open() note: ${e.targetException?.message}") // likely already open
+                trace("open() note: ${e.targetException?.message}") // likely already open
             } catch (_: NoSuchMethodException) {
                 try {
                     deviceCls.getMethod(
@@ -268,8 +303,9 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
                         Int::class.javaPrimitiveType,
                         Int::class.javaPrimitiveType
                     ).invoke(device, 0, 0)
+                    trace("open(0,0) ok")
                 } catch (e: java.lang.reflect.InvocationTargetException) {
-                    Log.d(TAG, "rf open(0,0) note: ${e.targetException?.message}")
+                    trace("open(0,0) note: ${e.targetException?.message}")
                 }
             }
 
@@ -296,8 +332,12 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
         synchronized(rfLock) {
             val device = rfDevice
             if (device != null) {
-                try { device.javaClass.getMethod("close").invoke(device) } catch (t: Throwable) {
-                    Log.d(TAG, "RF: close note: ${t.message}")
+                try {
+                    device.javaClass.getMethod("close").invoke(device)
+                    trace("close() ok")
+                } catch (t: Throwable) {
+                    val tgt = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
+                    trace("close() note: ${tgt.message}")
                 }
             }
             rfDevice = null
@@ -330,19 +370,17 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
             if (m != null) {
                 m.isAccessible = true
                 m.invoke(device)
-                Log.d(TAG, "RF: member searchEnd ok (search ended)")
+                trace("member searchEnd ok")
             } else {
                 // Fallback: the raw native searchEnd. Less ideal (no wrapper
                 // bookkeeping) but better than leaving the search open.
                 Class.forName("com.cloudpos.jniinterface.RFCardInterface")
                     .getMethod("searchEnd").invoke(null)
-                Log.d(TAG, "RF: native searchEnd fallback ok")
+                trace("native searchEnd fallback ok")
             }
         } catch (t: Throwable) {
-            // If ending the search fails we can't trust the native state —
-            // recycle so the next cycle reopens cleanly instead of wedging.
-            Log.d(TAG, "RF: searchEnd note: ${t.message} -> recycling")
-            recycleRfDevice()
+            val tgt = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
+            trace("searchEnd EXC ${tgt.javaClass.simpleName}: ${tgt.message}")
         }
     }
 
@@ -392,57 +430,125 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
      */
     private fun readNfcOnce(timeoutMs: Int): Map<String, Any?> {
         synchronized(rfLock) {
-            val device = ensureRfDevice() ?: return fail("unavailable")
+            val seq = ++readSeq
+            trace("read#$seq START (timeout=${timeoutMs}ms)")
+
+            // STRATEGY: full close+reopen every read. The reader is a native
+            // singleton and the ONLY thing we've found that reliably resets its
+            // internal search state across reads is a complete close()+open().
+            // We do it defensively and trace each sub-step so, if it still fails
+            // on read#2, the on-screen log tells us EXACTLY which native call
+            // misbehaves (open threw? waitForCardPresent returns odd code?).
+            recycleRfDeviceTraced(seq)
+
+            val device = ensureRfDeviceTraced(seq) ?: run {
+                trace("read#$seq FAIL ensureRfDevice=null ($rfDiag)")
+                return fail("unavailable")
+            }
             val deviceCls = rfDeviceCls ?: device.javaClass
+
             return try {
+                trace("read#$seq waitForCardPresent...")
                 val opResult = deviceCls
                     .getMethod("waitForCardPresent", Int::class.javaPrimitiveType)
                     .invoke(device, timeoutMs)
-                    ?: run { rfDiag = "poll timeout (no card in window)"; return fail("timeout") }
+                if (opResult == null) {
+                    rfDiag = "poll timeout (null result)"
+                    trace("read#$seq waitForCardPresent -> null")
+                    endSearchSession(device, deviceCls)
+                    return fail("timeout")
+                }
 
                 // CloudPOS OperationResult.SUCCESS == 1 (0 == NONE/idle).
                 val resultCode = (opResult.javaClass.getMethod("getResultCode").invoke(opResult) as? Int) ?: -1
                 val successCode = operationSuccessCode()   // == 1 on this SDK
-                Log.d(TAG, "RF: waitForCardPresent resultCode=$resultCode (success=$successCode)")
-                if (resultCode != successCode && resultCode == operationTimeoutCode()) {
-                    rfDiag = "poll timeout (no card in window)"
-                    // Nothing was found, but searchBegin() DID run inside
-                    // waitForCardPresent — balance it so the next poll is clean.
+                trace("read#$seq resultCode=$resultCode (success=$successCode, timeout=${operationTimeoutCode()})")
+
+                if (resultCode != successCode) {
+                    rfDiag = "poll resultCode=$resultCode (no card)"
                     endSearchSession(device, deviceCls)
                     return fail("timeout")
                 }
 
                 val card = opResult.javaClass.getMethod("getCard").invoke(opResult)
-                    ?: run {
-                        rfDiag = "resultCode=$resultCode but getCard()=null"
-                        endSearchSession(device, deviceCls)
-                        return fail("no_card")
-                    }
+                if (card == null) {
+                    rfDiag = "resultCode=$resultCode but getCard()=null"
+                    trace("read#$seq getCard()=null")
+                    endSearchSession(device, deviceCls)
+                    return fail("no_card")
+                }
                 val idBytes = card.javaClass.getMethod("getID").invoke(card) as? ByteArray
                 val uid = idBytes?.joinToString("") { "%02X".format(it) } ?: ""
                 if (uid.isEmpty()) {
                     rfDiag = "card present but empty UID"
+                    trace("read#$seq empty UID")
                     endSearchSession(device, deviceCls)
                     return fail("no_card")
                 }
 
                 val cardType = readCardType(device, deviceCls)
                 rfDiag = "CARD READ ok uid=$uid type=$cardType"
-                Log.i(TAG, "RF: $rfDiag")
+                trace("read#$seq OK uid=$uid type=$cardType")
 
-                // CRITICAL: end the search session the SDK-sanctioned way so the
-                // NEXT waitForCardPresent() can start a fresh search. Without
-                // this the reader reads exactly once and then never again.
                 endSearchSession(device, deviceCls)
 
                 mapOf("ok" to true, "uid" to uid, "cardType" to cardType)
             } catch (t: Throwable) {
-                rfDiag = "readNfcOnce error: ${t.javaClass.simpleName}: ${t.message}"
-                Log.w(TAG, rfDiag)
+                val tgt = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
+                rfDiag = "readNfcOnce error: ${tgt.javaClass.simpleName}: ${tgt.message}"
+                trace("read#$seq EXC ${tgt.javaClass.simpleName}: ${tgt.message}")
                 // Hard failure -> drop the handle so the next read reopens clean.
                 recycleRfDevice()
-                fail(if (t is ClassNotFoundException) "unavailable" else "error")
+                fail(if (tgt is ClassNotFoundException) "unavailable" else "error")
             }
+        }
+    }
+
+    /** ensureRfDevice with trace lines (used by readNfcOnce). */
+    private fun ensureRfDeviceTraced(seq: Int): Any? {
+        if (rfDevice != null) { trace("read#$seq reuse cached device"); return rfDevice }
+        val d = ensureRfDevice()
+        trace("read#$seq ensureRfDevice -> ${if (d != null) "ok" else "null"} ($rfDiag)")
+        return d
+    }
+
+    /** recycleRfDevice with trace lines (used by readNfcOnce). */
+    private fun recycleRfDeviceTraced(seq: Int) {
+        val had = rfDevice != null
+        recycleRfDevice()
+        if (had) trace("read#$seq recycled (close+clear)")
+    }
+
+    /**
+     * Enumerates the native RF methods present on THIS device's SDK build, plus
+     * a live self-test of the reset primitives — so we can see empirically which
+     * calls exist and which throw, instead of guessing from a decompiled AAR.
+     */
+    private fun listRfMethods(): String {
+        return synchronized(rfLock) {
+            val sb = StringBuilder()
+            val device = ensureRfDevice()
+            if (device == null) { return@synchronized "no device ($rfDiag)" }
+            val cls = device.javaClass
+            sb.append("class=${cls.name}\n")
+            val wanted = listOf(
+                "open", "close", "waitForCardPresent", "waitForCardAbsent",
+                "cancelRequest", "searchEnd", "detach", "skipRATS",
+                "getCardTypeValue", "getCardStatus", "detectCardStatus",
+                "enableLowPowerCardDetect", "disableLowPowerCardDetect",
+            )
+            for (name in wanted) {
+                val m = findDeclaredMethod(cls, name)
+                sb.append(if (m != null) "✓ $name\n" else "✗ $name\n")
+            }
+            // Native JNI layer availability.
+            sb.append(
+                try {
+                    Class.forName("com.cloudpos.jniinterface.RFCardInterface")
+                    "jni RFCardInterface: present\n"
+                } catch (_: Throwable) { "jni RFCardInterface: MISSING\n" }
+            )
+            sb.toString().trimEnd()
         }
     }
 

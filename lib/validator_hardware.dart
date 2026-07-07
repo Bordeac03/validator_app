@@ -149,6 +149,29 @@ class ValidatorHardware {
     }
   }
 
+  /// Returns the rolling, timestamped native RF step log (open/close/
+  /// waitForCardPresent/resultCode/searchEnd) so the user can screenshot
+  /// exactly what happens on read #1 vs read #2.
+  Future<String> nfcTrace() async {
+    if (!isSupportedPlatform) return 'unsupported platform';
+    try {
+      return (await _channel.invokeMethod<String>('nfcTrace')) ?? '(null)';
+    } catch (e) {
+      return 'trace error: $e';
+    }
+  }
+
+  /// Lists which native RF methods exist on THIS device's SDK build (✓/✗),
+  /// used to stop guessing which reset primitives are available.
+  Future<String> nfcMethods() async {
+    if (!isSupportedPlatform) return 'unsupported platform';
+    try {
+      return (await _channel.invokeMethod<String>('nfcMethods')) ?? '(null)';
+    } catch (e) {
+      return 'methods error: $e';
+    }
+  }
+
   Future<bool> startKiosk() async {
     if (!isSupportedPlatform) return false;
     try {

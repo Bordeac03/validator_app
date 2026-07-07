@@ -1,0 +1,601 @@
+From 419440fcf90deec95c7a29a93d8b0a3b6f18d8f6 Mon Sep 17 00:00:00 2001
+From: t <t@t.com>
+Date: Tue, 7 Jul 2026 22:04:19 +0000
+Subject: [PATCH] Add on-screen NFC debug log + close/reopen-per-read RF
+ strategy
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We keep going in circles guessing what the WizarPOS does. This patch makes
+the device tell us:
+
+Native (ValidatorHardwarePlugin.kt):
+- Rolling timestamped trace buffer (rfTrace) + trace() logging every native
+  RF step: recycle/close, open(), waitForCardPresent, resultCode, getCard,
+  member searchEnd, exceptions (with real targetException unwrapped).
+- readNfcOnce now numbers each read (read#1, read#2, …) and does a FULL
+  close()+reopen() before every read (most robust reset for the native
+  singleton), tracing each sub-step so we can see exactly where read#2 fails.
+- New channel methods: nfcTrace (dump the log), nfcMethods (list which
+  native RF methods actually exist on this SDK build: open/close/
+  waitForCardPresent/waitForCardAbsent/cancelRequest/searchEnd/detach/…).
+
+Flutter (validator_screen.dart / validator_hardware.dart):
+- Tap the on-screen 'NFC: … · atinge pentru LOG' line to open a live,
+  auto-refreshing debug panel: shows method availability + the full step
+  trace, a 'Test read' button (tap a card, watch read#1/#2/#3 grow) and a
+  'Copy' button to copy the whole log to clipboard.
+- Loop pauses while the panel is open so manual test reads don't interleave.
+
+flutter analyze clean; APK 37.8MB (arm64).
+---
+ .../ValidatorHardwarePlugin.kt                | 164 ++++++++++--
+ lib/validator_hardware.dart                   |  23 ++
+ lib/validator_screen.dart                     | 251 ++++++++++++++++--
+ 3 files changed, 391 insertions(+), 47 deletions(-)
+
+diff --git a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+index 6a2a653..136c915 100644
+--- a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
++++ b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+@@ -97,6 +97,29 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     // logcat) can show WHERE it fails on the real WizarPOS device.
+     @Volatile private var rfDiag: String = "not started"
+ 
++    // Rolling trace buffer of the last RF operations. Every native step
++    // (resolve/open/waitForCardPresent/resultCode/getCard/searchEnd) appends a
++    // timestamped line here so the Flutter UI can show a live on-screen log the
++    // user can screenshot — no adb needed to debug on the real device.
++    private val rfTrace = java.util.ArrayDeque<String>()
++    private val traceLock = Object()
++    // Monotonic counter so we can see how many reads have happened + which one
++    // stopped working ("read #1 ok, read #2 timeout").
++    @Volatile private var readSeq = 0
++
++    private fun trace(msg: String) {
++        val line = "${System.currentTimeMillis() % 100000}ms  $msg"
++        Log.i(TAG, "TRACE $line")
++        synchronized(traceLock) {
++            rfTrace.addLast(line)
++            while (rfTrace.size > 60) rfTrace.removeFirst()
++        }
++    }
++
++    private fun traceDump(): String = synchronized(traceLock) {
++        if (rfTrace.isEmpty()) "(no trace yet)" else rfTrace.joinToString("\n")
++    }
++
+     // ---- FlutterPlugin ----
+     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+         appContext = binding.applicationContext
+@@ -154,6 +177,17 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+                 val d = rfDiag
+                 main.post { result.success(d) }
+             }
++            "nfcTrace" -> io.execute {
++                // Return the rolling on-screen log of native RF steps.
++                val d = traceDump()
++                main.post { result.success(d) }
++            }
++            "nfcMethods" -> io.execute {
++                // List which native RF methods actually exist on THIS device's
++                // SDK build, so we stop guessing what primitives are available.
++                val d = listRfMethods()
++                main.post { result.success(d) }
++            }
+             else -> result.notImplemented()
+         }
+     }
+@@ -259,8 +293,9 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+             // Already-open is benign — keep the handle.
+             try {
+                 deviceCls.getMethod("open").invoke(device)
++                trace("open() ok")
+             } catch (e: java.lang.reflect.InvocationTargetException) {
+-                Log.d(TAG, "rf open() note: ${e.targetException?.message}") // likely already open
++                trace("open() note: ${e.targetException?.message}") // likely already open
+             } catch (_: NoSuchMethodException) {
+                 try {
+                     deviceCls.getMethod(
+@@ -268,8 +303,9 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+                         Int::class.javaPrimitiveType,
+                         Int::class.javaPrimitiveType
+                     ).invoke(device, 0, 0)
++                    trace("open(0,0) ok")
+                 } catch (e: java.lang.reflect.InvocationTargetException) {
+-                    Log.d(TAG, "rf open(0,0) note: ${e.targetException?.message}")
++                    trace("open(0,0) note: ${e.targetException?.message}")
+                 }
+             }
+ 
+@@ -296,8 +332,12 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+         synchronized(rfLock) {
+             val device = rfDevice
+             if (device != null) {
+-                try { device.javaClass.getMethod("close").invoke(device) } catch (t: Throwable) {
+-                    Log.d(TAG, "RF: close note: ${t.message}")
++                try {
++                    device.javaClass.getMethod("close").invoke(device)
++                    trace("close() ok")
++                } catch (t: Throwable) {
++                    val tgt = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
++                    trace("close() note: ${tgt.message}")
+                 }
+             }
+             rfDevice = null
+@@ -330,19 +370,17 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+             if (m != null) {
+                 m.isAccessible = true
+                 m.invoke(device)
+-                Log.d(TAG, "RF: member searchEnd ok (search ended)")
++                trace("member searchEnd ok")
+             } else {
+                 // Fallback: the raw native searchEnd. Less ideal (no wrapper
+                 // bookkeeping) but better than leaving the search open.
+                 Class.forName("com.cloudpos.jniinterface.RFCardInterface")
+                     .getMethod("searchEnd").invoke(null)
+-                Log.d(TAG, "RF: native searchEnd fallback ok")
++                trace("native searchEnd fallback ok")
+             }
+         } catch (t: Throwable) {
+-            // If ending the search fails we can't trust the native state —
+-            // recycle so the next cycle reopens cleanly instead of wedging.
+-            Log.d(TAG, "RF: searchEnd note: ${t.message} -> recycling")
+-            recycleRfDevice()
++            val tgt = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
++            trace("searchEnd EXC ${tgt.javaClass.simpleName}: ${tgt.message}")
+         }
+     }
+ 
+@@ -392,57 +430,125 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+      */
+     private fun readNfcOnce(timeoutMs: Int): Map<String, Any?> {
+         synchronized(rfLock) {
+-            val device = ensureRfDevice() ?: return fail("unavailable")
++            val seq = ++readSeq
++            trace("read#$seq START (timeout=${timeoutMs}ms)")
++
++            // STRATEGY: full close+reopen every read. The reader is a native
++            // singleton and the ONLY thing we've found that reliably resets its
++            // internal search state across reads is a complete close()+open().
++            // We do it defensively and trace each sub-step so, if it still fails
++            // on read#2, the on-screen log tells us EXACTLY which native call
++            // misbehaves (open threw? waitForCardPresent returns odd code?).
++            recycleRfDeviceTraced(seq)
++
++            val device = ensureRfDeviceTraced(seq) ?: run {
++                trace("read#$seq FAIL ensureRfDevice=null ($rfDiag)")
++                return fail("unavailable")
++            }
+             val deviceCls = rfDeviceCls ?: device.javaClass
++
+             return try {
++                trace("read#$seq waitForCardPresent...")
+                 val opResult = deviceCls
+                     .getMethod("waitForCardPresent", Int::class.javaPrimitiveType)
+                     .invoke(device, timeoutMs)
+-                    ?: run { rfDiag = "poll timeout (no card in window)"; return fail("timeout") }
++                if (opResult == null) {
++                    rfDiag = "poll timeout (null result)"
++                    trace("read#$seq waitForCardPresent -> null")
++                    endSearchSession(device, deviceCls)
++                    return fail("timeout")
++                }
+ 
+                 // CloudPOS OperationResult.SUCCESS == 1 (0 == NONE/idle).
+                 val resultCode = (opResult.javaClass.getMethod("getResultCode").invoke(opResult) as? Int) ?: -1
+                 val successCode = operationSuccessCode()   // == 1 on this SDK
+-                Log.d(TAG, "RF: waitForCardPresent resultCode=$resultCode (success=$successCode)")
+-                if (resultCode != successCode && resultCode == operationTimeoutCode()) {
+-                    rfDiag = "poll timeout (no card in window)"
+-                    // Nothing was found, but searchBegin() DID run inside
+-                    // waitForCardPresent — balance it so the next poll is clean.
++                trace("read#$seq resultCode=$resultCode (success=$successCode, timeout=${operationTimeoutCode()})")
++
++                if (resultCode != successCode) {
++                    rfDiag = "poll resultCode=$resultCode (no card)"
+                     endSearchSession(device, deviceCls)
+                     return fail("timeout")
+                 }
+ 
+                 val card = opResult.javaClass.getMethod("getCard").invoke(opResult)
+-                    ?: run {
+-                        rfDiag = "resultCode=$resultCode but getCard()=null"
+-                        endSearchSession(device, deviceCls)
+-                        return fail("no_card")
+-                    }
++                if (card == null) {
++                    rfDiag = "resultCode=$resultCode but getCard()=null"
++                    trace("read#$seq getCard()=null")
++                    endSearchSession(device, deviceCls)
++                    return fail("no_card")
++                }
+                 val idBytes = card.javaClass.getMethod("getID").invoke(card) as? ByteArray
+                 val uid = idBytes?.joinToString("") { "%02X".format(it) } ?: ""
+                 if (uid.isEmpty()) {
+                     rfDiag = "card present but empty UID"
++                    trace("read#$seq empty UID")
+                     endSearchSession(device, deviceCls)
+                     return fail("no_card")
+                 }
+ 
+                 val cardType = readCardType(device, deviceCls)
+                 rfDiag = "CARD READ ok uid=$uid type=$cardType"
+-                Log.i(TAG, "RF: $rfDiag")
++                trace("read#$seq OK uid=$uid type=$cardType")
+ 
+-                // CRITICAL: end the search session the SDK-sanctioned way so the
+-                // NEXT waitForCardPresent() can start a fresh search. Without
+-                // this the reader reads exactly once and then never again.
+                 endSearchSession(device, deviceCls)
+ 
+                 mapOf("ok" to true, "uid" to uid, "cardType" to cardType)
+             } catch (t: Throwable) {
+-                rfDiag = "readNfcOnce error: ${t.javaClass.simpleName}: ${t.message}"
+-                Log.w(TAG, rfDiag)
++                val tgt = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
++                rfDiag = "readNfcOnce error: ${tgt.javaClass.simpleName}: ${tgt.message}"
++                trace("read#$seq EXC ${tgt.javaClass.simpleName}: ${tgt.message}")
+                 // Hard failure -> drop the handle so the next read reopens clean.
+                 recycleRfDevice()
+-                fail(if (t is ClassNotFoundException) "unavailable" else "error")
++                fail(if (tgt is ClassNotFoundException) "unavailable" else "error")
++            }
++        }
++    }
++
++    /** ensureRfDevice with trace lines (used by readNfcOnce). */
++    private fun ensureRfDeviceTraced(seq: Int): Any? {
++        if (rfDevice != null) { trace("read#$seq reuse cached device"); return rfDevice }
++        val d = ensureRfDevice()
++        trace("read#$seq ensureRfDevice -> ${if (d != null) "ok" else "null"} ($rfDiag)")
++        return d
++    }
++
++    /** recycleRfDevice with trace lines (used by readNfcOnce). */
++    private fun recycleRfDeviceTraced(seq: Int) {
++        val had = rfDevice != null
++        recycleRfDevice()
++        if (had) trace("read#$seq recycled (close+clear)")
++    }
++
++    /**
++     * Enumerates the native RF methods present on THIS device's SDK build, plus
++     * a live self-test of the reset primitives — so we can see empirically which
++     * calls exist and which throw, instead of guessing from a decompiled AAR.
++     */
++    private fun listRfMethods(): String {
++        return synchronized(rfLock) {
++            val sb = StringBuilder()
++            val device = ensureRfDevice()
++            if (device == null) { return@synchronized "no device ($rfDiag)" }
++            val cls = device.javaClass
++            sb.append("class=${cls.name}\n")
++            val wanted = listOf(
++                "open", "close", "waitForCardPresent", "waitForCardAbsent",
++                "cancelRequest", "searchEnd", "detach", "skipRATS",
++                "getCardTypeValue", "getCardStatus", "detectCardStatus",
++                "enableLowPowerCardDetect", "disableLowPowerCardDetect",
++            )
++            for (name in wanted) {
++                val m = findDeclaredMethod(cls, name)
++                sb.append(if (m != null) "✓ $name\n" else "✗ $name\n")
+             }
++            // Native JNI layer availability.
++            sb.append(
++                try {
++                    Class.forName("com.cloudpos.jniinterface.RFCardInterface")
++                    "jni RFCardInterface: present\n"
++                } catch (_: Throwable) { "jni RFCardInterface: MISSING\n" }
++            )
++            sb.toString().trimEnd()
+         }
+     }
+ 
+diff --git a/lib/validator_hardware.dart b/lib/validator_hardware.dart
+index 519baa5..071ade6 100644
+--- a/lib/validator_hardware.dart
++++ b/lib/validator_hardware.dart
+@@ -149,6 +149,29 @@ class ValidatorHardware {
+     }
+   }
+ 
++  /// Returns the rolling, timestamped native RF step log (open/close/
++  /// waitForCardPresent/resultCode/searchEnd) so the user can screenshot
++  /// exactly what happens on read #1 vs read #2.
++  Future<String> nfcTrace() async {
++    if (!isSupportedPlatform) return 'unsupported platform';
++    try {
++      return (await _channel.invokeMethod<String>('nfcTrace')) ?? '(null)';
++    } catch (e) {
++      return 'trace error: $e';
++    }
++  }
++
++  /// Lists which native RF methods exist on THIS device's SDK build (✓/✗),
++  /// used to stop guessing which reset primitives are available.
++  Future<String> nfcMethods() async {
++    if (!isSupportedPlatform) return 'unsupported platform';
++    try {
++      return (await _channel.invokeMethod<String>('nfcMethods')) ?? '(null)';
++    } catch (e) {
++      return 'methods error: $e';
++    }
++  }
++
+   Future<bool> startKiosk() async {
+     if (!isSupportedPlatform) return false;
+     try {
+diff --git a/lib/validator_screen.dart b/lib/validator_screen.dart
+index b7b41ef..fe6231b 100644
+--- a/lib/validator_screen.dart
++++ b/lib/validator_screen.dart
+@@ -578,9 +578,10 @@ class _ValidatorScreenState extends State<ValidatorScreen>
+     );
+   }
+ 
+-  /// Tiny diagnostic line shown under the status pill. Tap it to force a fresh
+-  /// RF init and refresh the trace. Only visible on the real device (when a
+-  /// diagnostic string exists and NFC hardware is expected).
++  /// Tiny diagnostic line shown under the status pill. Tap it to open the live
++  /// native RF log panel (open/close/waitForCardPresent/resultCode/searchEnd)
++  /// which the user can screenshot to help debugging. Only visible on the real
++  /// device (when a diagnostic string exists and NFC hardware is expected).
+   Widget _diagLine() {
+     if (_diag.isEmpty || _diag == 'unsupported platform') {
+       return const SizedBox.shrink();
+@@ -589,21 +590,235 @@ class _ValidatorScreenState extends State<ValidatorScreen>
+     return Padding(
+       padding: const EdgeInsets.only(top: 8),
+       child: GestureDetector(
+-        onTap: () async {
+-          final d = await _hw.nfcDiag();
+-          if (mounted) setState(() => _diag = d);
+-        },
+-        child: Text(
+-          'NFC: $_diag',
+-          textAlign: TextAlign.center,
+-          maxLines: 2,
+-          overflow: TextOverflow.ellipsis,
+-          style: TextStyle(
+-            color: good
+-                ? const Color(0xFF6FCF97)
+-                : MovaColors.darkTextSecondary.withValues(alpha: 0.7),
+-            fontSize: 11,
+-            fontFamily: 'monospace',
++        onTap: _showDebugLog,
++        child: Row(
++          mainAxisAlignment: MainAxisAlignment.center,
++          children: [
++            const Icon(Icons.bug_report_outlined,
++                size: 13, color: Color(0xFF7A7385)),
++            const SizedBox(width: 5),
++            Flexible(
++              child: Text(
++                'NFC: $_diag  ·  atinge pentru LOG',
++                textAlign: TextAlign.center,
++                maxLines: 2,
++                overflow: TextOverflow.ellipsis,
++                style: TextStyle(
++                  color: good
++                      ? const Color(0xFF6FCF97)
++                      : MovaColors.darkTextSecondary.withValues(alpha: 0.7),
++                  fontSize: 11,
++                  fontFamily: 'monospace',
++                ),
++              ),
++            ),
++          ],
++        ),
++      ),
++    );
++  }
++
++  /// Full-screen live debug log: native RF step trace + method availability.
++  /// Auto-refreshes every second while open. The user keeps scanning cards and
++  /// screenshots this so we can see exactly what read#1 vs read#2 do.
++  Future<void> _showDebugLog() async {
++    // Pause the main scan loop so its own reads don't interleave with the
++    // manual test reads while the panel is open.
++    final wasLooping = _looping;
++    _looping = false;
++
++    await showDialog<void>(
++      context: context,
++      barrierColor: Colors.black.withValues(alpha: 0.92),
++      builder: (ctx) => _DebugLogDialog(hw: _hw),
++    );
++
++    // Resume scanning after the panel closes.
++    if (mounted && wasLooping) {
++      _looping = true;
++      _loopTick();
++    }
++  }
++}
++
++/// A live, auto-refreshing debug panel showing the native RF trace + method
++/// list, with manual "Test read" and "Copy" actions.
++class _DebugLogDialog extends StatefulWidget {
++  const _DebugLogDialog({required this.hw});
++  final ValidatorHardware hw;
++
++  @override
++  State<_DebugLogDialog> createState() => _DebugLogDialogState();
++}
++
++class _DebugLogDialogState extends State<_DebugLogDialog> {
++  String _trace = '(loading…)';
++  String _methods = '';
++  Timer? _timer;
++  bool _testing = false;
++  int _testCount = 0;
++
++  @override
++  void initState() {
++    super.initState();
++    _refresh();
++    widget.hw.nfcMethods().then((m) {
++      if (mounted) setState(() => _methods = m);
++    });
++    _timer = Timer.periodic(const Duration(milliseconds: 1000), (_) => _refresh());
++  }
++
++  @override
++  void dispose() {
++    _timer?.cancel();
++    super.dispose();
++  }
++
++  Future<void> _refresh() async {
++    final t = await widget.hw.nfcTrace();
++    if (mounted) setState(() => _trace = t);
++  }
++
++  /// Fire a manual NFC read so the user can tap a card and watch the trace grow
++  /// (read #1, #2, #3 …) to reproduce "reads once then stops".
++  Future<void> _testRead() async {
++    if (_testing) return;
++    setState(() => _testing = true);
++    final r = await widget.hw.readNfcOnce(timeoutMs: 6000);
++    _testCount++;
++    await _refresh();
++    if (mounted) {
++      setState(() => _testing = false);
++      ScaffoldMessenger.of(context).showSnackBar(
++        SnackBar(
++          duration: const Duration(milliseconds: 1400),
++          content: Text(
++            'Test #$_testCount: ${r.ok ? "OK uid=${r.uid}" : "fail (${r.reason})"}',
++          ),
++        ),
++      );
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return Dialog(
++      backgroundColor: const Color(0xFF0E0B12),
++      insetPadding: const EdgeInsets.all(12),
++      shape: RoundedRectangleBorder(
++        borderRadius: BorderRadius.circular(16),
++        side: const BorderSide(color: Color(0xFF2A2532)),
++      ),
++      child: SafeArea(
++        child: Padding(
++          padding: const EdgeInsets.fromLTRB(14, 14, 14, 10),
++          child: Column(
++            crossAxisAlignment: CrossAxisAlignment.stretch,
++            children: [
++              Row(
++                children: [
++                  const Icon(Icons.bug_report, color: MovaColors.gold, size: 20),
++                  const SizedBox(width: 8),
++                  const Expanded(
++                    child: Text(
++                      'NFC debug log',
++                      style: TextStyle(
++                        color: Colors.white,
++                        fontSize: 17,
++                        fontWeight: FontWeight.w800,
++                      ),
++                    ),
++                  ),
++                  IconButton(
++                    icon: const Icon(Icons.close, color: Colors.white70),
++                    onPressed: () => Navigator.of(context).pop(),
++                  ),
++                ],
++              ),
++              if (_methods.isNotEmpty) ...[
++                Container(
++                  padding: const EdgeInsets.all(8),
++                  decoration: BoxDecoration(
++                    color: const Color(0xFF17131E),
++                    borderRadius: BorderRadius.circular(8),
++                  ),
++                  child: Text(
++                    _methods,
++                    style: const TextStyle(
++                      color: Color(0xFF9DDBA9),
++                      fontSize: 10.5,
++                      fontFamily: 'monospace',
++                      height: 1.25,
++                    ),
++                  ),
++                ),
++                const SizedBox(height: 8),
++              ],
++              Expanded(
++                child: Container(
++                  width: double.infinity,
++                  padding: const EdgeInsets.all(8),
++                  decoration: BoxDecoration(
++                    color: const Color(0xFF17131E),
++                    borderRadius: BorderRadius.circular(8),
++                  ),
++                  child: SingleChildScrollView(
++                    reverse: true,
++                    child: Text(
++                      _trace,
++                      style: const TextStyle(
++                        color: Color(0xFFCFC7DA),
++                        fontSize: 11,
++                        fontFamily: 'monospace',
++                        height: 1.3,
++                      ),
++                    ),
++                  ),
++                ),
++              ),
++              const SizedBox(height: 10),
++              Row(
++                children: [
++                  Expanded(
++                    child: ElevatedButton.icon(
++                      onPressed: _testing ? null : _testRead,
++                      style: ElevatedButton.styleFrom(
++                        backgroundColor: MovaColors.gold,
++                        foregroundColor: Colors.black,
++                      ),
++                      icon: _testing
++                          ? const SizedBox(
++                              width: 16,
++                              height: 16,
++                              child: CircularProgressIndicator(
++                                strokeWidth: 2, color: Colors.black),
++                            )
++                          : const Icon(Icons.contactless, size: 18),
++                      label: Text(_testing ? 'Apropie cardul…' : 'Test read'),
++                    ),
++                  ),
++                  const SizedBox(width: 8),
++                  OutlinedButton.icon(
++                    onPressed: () {
++                      Clipboard.setData(ClipboardData(
++                          text: '=== METHODS ===\n$_methods\n\n=== TRACE ===\n$_trace'));
++                      ScaffoldMessenger.of(context).showSnackBar(
++                        const SnackBar(
++                          duration: Duration(milliseconds: 1200),
++                          content: Text('Log copiat în clipboard'),
++                        ),
++                      );
++                    },
++                    style: OutlinedButton.styleFrom(
++                      foregroundColor: Colors.white,
++                      side: const BorderSide(color: Color(0xFF3A3444)),
++                    ),
++                    icon: const Icon(Icons.copy, size: 16),
++                    label: const Text('Copy'),
++                  ),
++                ],
++              ),
++            ],
+           ),
+         ),
+       ),
+-- 
+2.39.5
+

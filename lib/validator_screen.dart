@@ -578,9 +578,10 @@ class _ValidatorScreenState extends State<ValidatorScreen>
     );
   }
 
-  /// Tiny diagnostic line shown under the status pill. Tap it to force a fresh
-  /// RF init and refresh the trace. Only visible on the real device (when a
-  /// diagnostic string exists and NFC hardware is expected).
+  /// Tiny diagnostic line shown under the status pill. Tap it to open the live
+  /// native RF log panel (open/close/waitForCardPresent/resultCode/searchEnd)
+  /// which the user can screenshot to help debugging. Only visible on the real
+  /// device (when a diagnostic string exists and NFC hardware is expected).
   Widget _diagLine() {
     if (_diag.isEmpty || _diag == 'unsupported platform') {
       return const SizedBox.shrink();
@@ -589,21 +590,235 @@ class _ValidatorScreenState extends State<ValidatorScreen>
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: GestureDetector(
-        onTap: () async {
-          final d = await _hw.nfcDiag();
-          if (mounted) setState(() => _diag = d);
-        },
-        child: Text(
-          'NFC: $_diag',
-          textAlign: TextAlign.center,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: good
-                ? const Color(0xFF6FCF97)
-                : MovaColors.darkTextSecondary.withValues(alpha: 0.7),
-            fontSize: 11,
-            fontFamily: 'monospace',
+        onTap: _showDebugLog,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.bug_report_outlined,
+                size: 13, color: Color(0xFF7A7385)),
+            const SizedBox(width: 5),
+            Flexible(
+              child: Text(
+                'NFC: $_diag  ·  atinge pentru LOG',
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: good
+                      ? const Color(0xFF6FCF97)
+                      : MovaColors.darkTextSecondary.withValues(alpha: 0.7),
+                  fontSize: 11,
+                  fontFamily: 'monospace',
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Full-screen live debug log: native RF step trace + method availability.
+  /// Auto-refreshes every second while open. The user keeps scanning cards and
+  /// screenshots this so we can see exactly what read#1 vs read#2 do.
+  Future<void> _showDebugLog() async {
+    // Pause the main scan loop so its own reads don't interleave with the
+    // manual test reads while the panel is open.
+    final wasLooping = _looping;
+    _looping = false;
+
+    await showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.92),
+      builder: (ctx) => _DebugLogDialog(hw: _hw),
+    );
+
+    // Resume scanning after the panel closes.
+    if (mounted && wasLooping) {
+      _looping = true;
+      _loopTick();
+    }
+  }
+}
+
+/// A live, auto-refreshing debug panel showing the native RF trace + method
+/// list, with manual "Test read" and "Copy" actions.
+class _DebugLogDialog extends StatefulWidget {
+  const _DebugLogDialog({required this.hw});
+  final ValidatorHardware hw;
+
+  @override
+  State<_DebugLogDialog> createState() => _DebugLogDialogState();
+}
+
+class _DebugLogDialogState extends State<_DebugLogDialog> {
+  String _trace = '(loading…)';
+  String _methods = '';
+  Timer? _timer;
+  bool _testing = false;
+  int _testCount = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+    widget.hw.nfcMethods().then((m) {
+      if (mounted) setState(() => _methods = m);
+    });
+    _timer = Timer.periodic(const Duration(milliseconds: 1000), (_) => _refresh());
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    final t = await widget.hw.nfcTrace();
+    if (mounted) setState(() => _trace = t);
+  }
+
+  /// Fire a manual NFC read so the user can tap a card and watch the trace grow
+  /// (read #1, #2, #3 …) to reproduce "reads once then stops".
+  Future<void> _testRead() async {
+    if (_testing) return;
+    setState(() => _testing = true);
+    final r = await widget.hw.readNfcOnce(timeoutMs: 6000);
+    _testCount++;
+    await _refresh();
+    if (mounted) {
+      setState(() => _testing = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          duration: const Duration(milliseconds: 1400),
+          content: Text(
+            'Test #$_testCount: ${r.ok ? "OK uid=${r.uid}" : "fail (${r.reason})"}',
+          ),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: const Color(0xFF0E0B12),
+      insetPadding: const EdgeInsets.all(12),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: const BorderSide(color: Color(0xFF2A2532)),
+      ),
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 14, 14, 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.bug_report, color: MovaColors.gold, size: 20),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'NFC debug log',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white70),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+              if (_methods.isNotEmpty) ...[
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF17131E),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    _methods,
+                    style: const TextStyle(
+                      color: Color(0xFF9DDBA9),
+                      fontSize: 10.5,
+                      fontFamily: 'monospace',
+                      height: 1.25,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
+              Expanded(
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF17131E),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: SingleChildScrollView(
+                    reverse: true,
+                    child: Text(
+                      _trace,
+                      style: const TextStyle(
+                        color: Color(0xFFCFC7DA),
+                        fontSize: 11,
+                        fontFamily: 'monospace',
+                        height: 1.3,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: _testing ? null : _testRead,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: MovaColors.gold,
+                        foregroundColor: Colors.black,
+                      ),
+                      icon: _testing
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2, color: Colors.black),
+                            )
+                          : const Icon(Icons.contactless, size: 18),
+                      label: Text(_testing ? 'Apropie cardul…' : 'Test read'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(
+                          text: '=== METHODS ===\n$_methods\n\n=== TRACE ===\n$_trace'));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          duration: Duration(milliseconds: 1200),
+                          content: Text('Log copiat în clipboard'),
+                        ),
+                      );
+                    },
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Color(0xFF3A3444)),
+                    ),
+                    icon: const Icon(Icons.copy, size: 16),
+                    label: const Text('Copy'),
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
       ),
