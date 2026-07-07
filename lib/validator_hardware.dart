@@ -125,6 +125,30 @@ class ValidatorHardware {
     }
   }
 
+  /// Pre-opens the RF reader and clears any stale native search session so the
+  /// FIRST poll after boot doesn't hit "no open window". Returns the resulting
+  /// diagnostic string. Safe to call multiple times.
+  Future<String> warmUpNfc() async {
+    if (!isSupportedPlatform) return 'unsupported platform';
+    try {
+      return (await _channel.invokeMethod<String>('warmUpNfc')) ?? '(null)';
+    } catch (e) {
+      return 'warmup error: $e';
+    }
+  }
+
+  /// Returns a human-readable trace of the last RF init/read attempt, so the
+  /// UI can show WHERE NFC fails on the real WizarPOS (device list, open error,
+  /// timeout, etc.). Empty string on unsupported platforms.
+  Future<String> nfcDiag() async {
+    if (!isSupportedPlatform) return 'unsupported platform';
+    try {
+      return (await _channel.invokeMethod<String>('nfcDiag')) ?? '(null)';
+    } catch (e) {
+      return 'diag error: $e';
+    }
+  }
+
   Future<bool> startKiosk() async {
     if (!isSupportedPlatform) return false;
     try {

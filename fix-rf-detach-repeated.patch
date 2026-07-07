@@ -1,0 +1,107 @@
+From 86edef8463a8d28f12232838de0681c23d0209f3 Mon Sep 17 00:00:00 2001
+From: genspark_dev <genspark_dev@genspark.ai>
+Date: Tue, 7 Jul 2026 20:53:06 +0000
+Subject: [PATCH] Fix RF scans only once: card stays ATTACHED after read so
+ reader never reports next present event. Call detach() after each read
+ (correct CloudPOS flow), replace close/reopen recycle; trim card-absent wait
+
+---
+ .../ValidatorHardwarePlugin.kt                | 62 +++++++++++--------
+ 1 file changed, 35 insertions(+), 27 deletions(-)
+
+diff --git a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+index 0cd8987..c044b91 100644
+--- a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
++++ b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+@@ -283,16 +283,30 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     }
+ 
+     /**
+-     * Fully cycles the RF reader (close + drop cache) so the NEXT ensureRfDevice()
+-     * reopens a fresh session. This resets the reader's edge-detection state so a
+-     * subsequent tap — even of the SAME card — is detected again. Called only
+-     * after a successful read, never during idle polling.
++     * Releases (detaches) the currently-attached RF card so the reader can
++     * search for the next one. This is the key to repeated reads: without it
++     * the reader stays latched to the first card and never reports another
++     * "present" event. Tries the public detach()/searchEnd()/halt() variants
++     * that exist across CloudPOS SDK builds; all best-effort.
+      */
+-    private fun recycleRfDevice() {
+-        releaseRfDevice()
+-        // Tiny settle delay so the hardware finishes powering the field down
+-        // before the next open() powers it back up.
+-        try { Thread.sleep(150) } catch (_: InterruptedException) {}
++    private fun detachRfCard(device: Any, cls: Class<*>) {
++        var detached = false
++        for (m in listOf("detach", "searchEnd", "halt", "reset")) {
++            try {
++                cls.getMethod(m).invoke(device)
++                detached = true
++                Log.d(TAG, "RF: $m() ok")
++                break
++            } catch (_: NoSuchMethodException) {
++                // try next name
++            } catch (t: Throwable) {
++                // Method exists but threw — still counts as an attempt.
++                Log.d(TAG, "RF: $m() note: ${t.message}")
++                detached = true
++                break
++            }
++        }
++        if (!detached) Log.d(TAG, "RF: no detach-style method found")
+     }
+ 
+     /**
+@@ -339,21 +353,18 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+             rfDiag = "CARD READ ok uid=$uid type=$cardType"
+             Log.i(TAG, "RF: $rfDiag")
+ 
+-            // Best-effort wait for the card to physically leave the field so the
+-            // SAME card isn't re-reported instantly.
++            // CRITICAL for repeated reads. After waitForCardPresent() the card
++            // is ATTACHED (activated) to the reader. Until it is DETACHED the
++            // reader stays busy with that card and searchBegin() for the next
++            // waitForCardPresent() never reports a new "present" event — so it
++            // "scans once and then stops". The correct CloudPOS flow is:
++            //   waitForCardPresent -> getCard -> use -> detach() -> ready again.
++            detachRfCard(device, deviceCls)
++            // Then let the physical card leave the field so we don't instantly
++            // re-read the same one while it's still on the reader.
+             waitForCardAbsent(device, deviceCls)
+             lastUid = uid
+ 
+-            // CRITICAL for repeated reads: the CloudPOS RF reader uses edge
+-            // detection — waitForCardPresent() only fires when a card goes from
+-            // ABSENT to PRESENT. If the user keeps (or re-taps) the same card,
+-            // the field can stay "latched present" and the next poll never
+-            // fires again ("scans once and then stops"). Fully cycling the
+-            // device (close + reopen) resets the field so the next tap — even
+-            // of the same card — is detected cleanly. This only runs AFTER a
+-            // successful read (rare), so it costs nothing during idle polling.
+-            recycleRfDevice()
+-
+             mapOf("ok" to true, "uid" to uid, "cardType" to cardType)
+         } catch (t: Throwable) {
+             rfDiag = "readNfcOnce error: ${t.javaClass.simpleName}: ${t.message}"
+@@ -386,14 +397,11 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     private fun waitForCardAbsent(device: Any, cls: Class<*>) {
+         try {
+             cls.getMethod("waitForCardAbsent", Int::class.javaPrimitiveType)
+-                .invoke(device, 1500)
++                .invoke(device, 800)
+             return
+         } catch (_: Throwable) { /* try next */ }
+-        try {
+-            cls.getMethod("removeCard").invoke(device)
+-        } catch (_: Throwable) { /* fine — just add a small settle delay */
+-            try { Thread.sleep(400) } catch (_: InterruptedException) {}
+-        }
++        // No waitForCardAbsent — settle briefly so the same tap isn't re-read.
++        try { Thread.sleep(300) } catch (_: InterruptedException) {}
+     }
+ 
+     private fun fail(reason: String) = mapOf("ok" to false, "uid" to null, "reason" to reason)
+-- 
+2.39.5
+

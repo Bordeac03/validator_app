@@ -1,0 +1,63 @@
+From c27ae847cc7749dda4f31d73d68d48f7824f423d Mon Sep 17 00:00:00 2001
+From: genspark_dev <genspark_dev@genspark.ai>
+Date: Tue, 7 Jul 2026 20:10:42 +0000
+Subject: [PATCH] Fix RF reads only once: CloudPOS reader uses edge detection,
+ so after a successful read the field stays latched and the same/next card is
+ never re-detected. Fully recycle (close+reopen) the reader after each
+ successful read so subsequent taps work
+
+---
+ .../ValidatorHardwarePlugin.kt                | 27 +++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+index 827163b..0cd8987 100644
+--- a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
++++ b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+@@ -282,6 +282,19 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+         }
+     }
+ 
++    /**
++     * Fully cycles the RF reader (close + drop cache) so the NEXT ensureRfDevice()
++     * reopens a fresh session. This resets the reader's edge-detection state so a
++     * subsequent tap — even of the SAME card — is detected again. Called only
++     * after a successful read, never during idle polling.
++     */
++    private fun recycleRfDevice() {
++        releaseRfDevice()
++        // Tiny settle delay so the hardware finishes powering the field down
++        // before the next open() powers it back up.
++        try { Thread.sleep(150) } catch (_: InterruptedException) {}
++    }
++
+     /**
+      * Waits up to [timeoutMs] for a single card on the SHARED (already-open) RF
+      * reader, reads its UID + type, then waits for the card to leave the field
+@@ -326,11 +339,21 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+             rfDiag = "CARD READ ok uid=$uid type=$cardType"
+             Log.i(TAG, "RF: $rfDiag")
+ 
+-            // Wait for the card to be removed so the loop doesn't fire the same
+-            // UID on the very next cycle while the user keeps holding it.
++            // Best-effort wait for the card to physically leave the field so the
++            // SAME card isn't re-reported instantly.
+             waitForCardAbsent(device, deviceCls)
+             lastUid = uid
+ 
++            // CRITICAL for repeated reads: the CloudPOS RF reader uses edge
++            // detection — waitForCardPresent() only fires when a card goes from
++            // ABSENT to PRESENT. If the user keeps (or re-taps) the same card,
++            // the field can stay "latched present" and the next poll never
++            // fires again ("scans once and then stops"). Fully cycling the
++            // device (close + reopen) resets the field so the next tap — even
++            // of the same card — is detected cleanly. This only runs AFTER a
++            // successful read (rare), so it costs nothing during idle polling.
++            recycleRfDevice()
++
+             mapOf("ok" to true, "uid" to uid, "cardType" to cardType)
+         } catch (t: Throwable) {
+             rfDiag = "readNfcOnce error: ${t.javaClass.simpleName}: ${t.message}"
+-- 
+2.39.5
+

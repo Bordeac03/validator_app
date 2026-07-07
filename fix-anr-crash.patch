@@ -1,0 +1,230 @@
+From c1f9b17f582f85d53696b093ab8f4d13a339cf67 Mon Sep 17 00:00:00 2001
+From: genspark_dev <genspark_dev@genspark.ai>
+Date: Tue, 7 Jul 2026 19:05:31 +0000
+Subject: [PATCH] Fix ANR + crash: bind scanner service once (reuse), run
+ scanBarcode on background thread, release on detach; add loop breather
+
+---
+ .../ValidatorHardwarePlugin.kt                | 164 +++++++++++++-----
+ lib/validator_screen.dart                     |   4 +
+ 2 files changed, 121 insertions(+), 47 deletions(-)
+
+diff --git a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+index ceb3431..e2d759c 100644
+--- a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
++++ b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+@@ -66,6 +66,17 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     private val io = Executors.newSingleThreadExecutor()
+     private val main = Handler(Looper.getMainLooper())
+ 
++    // ---- Persistent scanner service (bound ONCE, reused for every scan) ----
++    // Binding/unbinding on every scan (every ~2.5s) leaked ServiceConnections
++    // and eventually crashed the app; and calling scanBarcode() inside
++    // onServiceConnected blocked the main Binder thread => ANR. We now keep a
++    // single long-lived connection and only ever run scanBarcode() on the
++    // background `io` executor.
++    private val scanLock = Object()
++    private var scanConn: ServiceConnection? = null
++    @Volatile private var scanService: IScanService? = null
++    @Volatile private var scanBound = false
++
+     // ---- FlutterPlugin ----
+     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+         appContext = binding.applicationContext
+@@ -77,6 +88,9 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+         channel?.setMethodCallHandler(null)
+         channel = null
++        // Release the shared scanner connection so we never leak it.
++        releaseScannerService()
++        io.shutdownNow()
+     }
+ 
+     // ---- ActivityAware ----
+@@ -235,65 +249,121 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     // -------------------- QR scanner (system AIDL service) --------------------
+ 
+     /**
+-     * Binds the CloudPOS scanner service and performs ONE blocking scan.
+-     * Returns the decoded text or ok:false on timeout/unavailable.
++     * Performs ONE scan using the shared, long-lived scanner service.
++     *
++     * IMPORTANT: this method is always invoked from the background `io`
++     * executor (see onMethodCall), so the blocking scanBarcode() call NEVER
++     * runs on the main/UI thread. The service is bound only once (lazily) and
++     * then reused for every subsequent scan, so there is no bind/unbind churn.
+      */
+     private fun scanQrOnce(timeoutMs: Int): Map<String, Any?> {
+         val ctx = appContext ?: return mapOf("ok" to false, "reason" to "no_context")
+         if (!isPackageInstalled(SCAN_PKG)) {
+             return mapOf("ok" to false, "reason" to "unavailable")
+         }
+-        val lock = Object()
+-        var bound = false
+-        var scanText: String? = null
+-        var conn: ServiceConnection? = null
+-        try {
+-            conn = object : ServiceConnection {
+-                override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+-                    try {
+-                        val desc = service?.interfaceDescriptor
+-                        if (desc == SCAN_DESC && service != null) {
+-                            val scanService = IScanService.Stub.asInterface(service)
+-                            val p = ScanParameter()
+-                            // Headless, driver-less scan: no on-screen scanner UI,
+-                            // the validator's own Flutter screen stays visible.
+-                            p.set(ScanParameter.KEY_UI_WINDOW_WIDTH, 0)
+-                            p.set(ScanParameter.KEY_UI_WINDOW_HEIGHT, 0)
+-                            p.set(ScanParameter.KEY_SCAN_MODE, "overlay")
+-                            p.set(ScanParameter.KEY_ENABLE_MIRROR_SCAN, true)
+-                            p.set(ScanParameter.KEY_SCAN_TIME_OUT, timeoutMs)
+-                            // Suppress the built-in scanner beep (we give our own
+-                            // audio/visual feedback in Flutter) and hide any UI.
+-                            trySet(p, "KEY_ENABLE_SOUND", false)
+-                            trySet(p, "KEY_DISABLE_UI", true)
+-                            val res: ScanResult? = scanService.scanBarcode(p)
+-                            if (res != null && res.resultCode == ScanResult.SCAN_SUCCESS) {
+-                                // getText() = the decoded barcode payload
+-                                // (res.toString() would return the object dump).
+-                                val decoded = res.text
+-                                if (!decoded.isNullOrBlank()) scanText = decoded.trim()
++
++        // Ensure the service is bound (blocks the background thread, not UI).
++        val svc = ensureScannerService()
++            ?: return mapOf("ok" to false, "reason" to "bind_failed")
++
++        return try {
++            val p = ScanParameter()
++            // Headless, driver-less scan: no on-screen scanner UI,
++            // the validator's own Flutter screen stays visible.
++            p.set(ScanParameter.KEY_UI_WINDOW_WIDTH, 0)
++            p.set(ScanParameter.KEY_UI_WINDOW_HEIGHT, 0)
++            p.set(ScanParameter.KEY_SCAN_MODE, "overlay")
++            p.set(ScanParameter.KEY_ENABLE_MIRROR_SCAN, true)
++            p.set(ScanParameter.KEY_SCAN_TIME_OUT, timeoutMs)
++            // Suppress the built-in scanner beep (we give our own
++            // audio/visual feedback in Flutter) and hide any UI.
++            trySet(p, "KEY_ENABLE_SOUND", false)
++            trySet(p, "KEY_DISABLE_UI", true)
++
++            // Blocking call - safe here because we are on the io thread.
++            val res: ScanResult? = svc.scanBarcode(p)
++            if (res != null && res.resultCode == ScanResult.SCAN_SUCCESS) {
++                val decoded = res.text
++                if (!decoded.isNullOrBlank()) {
++                    return mapOf("ok" to true, "text" to decoded.trim())
++                }
++            }
++            mapOf("ok" to false, "text" to null)
++        } catch (t: Throwable) {
++            Log.w(TAG, "scanQrOnce failed: ${t.message}")
++            // The service may have died (process restart); drop the cached
++            // reference so the next call rebinds cleanly.
++            if (t is android.os.DeadObjectException || t is android.os.RemoteException) {
++                releaseScannerService()
++            }
++            mapOf("ok" to false, "reason" to "error")
++        }
++    }
++
++    /**
++     * Lazily binds the CloudPOS scanner AIDL service ONCE and caches the
++     * IScanService. Called from the background io thread; blocks up to ~5s for
++     * the connection to be established the first time, then returns the cached
++     * instance instantly for every subsequent scan.
++     */
++    private fun ensureScannerService(): IScanService? {
++        scanService?.let { return it }
++        val ctx = appContext ?: return null
++        synchronized(scanLock) {
++            // Double-checked: another thread may have bound while we waited.
++            scanService?.let { return it }
++            if (scanConn == null) {
++                val conn = object : ServiceConnection {
++                    override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
++                        synchronized(scanLock) {
++                            scanService = try {
++                                if (service != null) IScanService.Stub.asInterface(service) else null
++                            } catch (t: Throwable) {
++                                Log.w(TAG, "asInterface failed: ${t.message}")
++                                null
+                             }
++                            scanLock.notifyAll()
++                        }
++                    }
++                    override fun onServiceDisconnected(name: ComponentName?) {
++                        synchronized(scanLock) {
++                            scanService = null
++                            scanLock.notifyAll()
+                         }
+-                    } catch (t: Throwable) {
+-                        Log.w(TAG, "scan onConnected failed: ${t.message}")
+-                    } finally {
+-                        synchronized(lock) { lock.notifyAll() }
+                     }
+                 }
+-                override fun onServiceDisconnected(name: ComponentName?) {}
++                scanConn = conn
++                val intent = Intent().apply { component = ComponentName(SCAN_PKG, SCAN_CLS) }
++                scanBound = try {
++                    ctx.bindService(intent, conn, Context.BIND_AUTO_CREATE)
++                } catch (t: Throwable) {
++                    Log.w(TAG, "bindService failed: ${t.message}")
++                    false
++                }
++                if (!scanBound) {
++                    scanConn = null
++                    return null
++                }
++            }
++            // Wait for onServiceConnected (only the first time).
++            if (scanService == null) {
++                try { scanLock.wait(5000) } catch (_: InterruptedException) {}
+             }
+-            val intent = Intent().apply { component = ComponentName(SCAN_PKG, SCAN_CLS) }
+-            bound = ctx.bindService(intent, conn, Context.BIND_AUTO_CREATE)
+-            ctx.startService(intent)
+-            if (!bound) return mapOf("ok" to false, "reason" to "bind_failed")
++            return scanService
++        }
++    }
+ 
+-            synchronized(lock) { lock.wait((timeoutMs + 3000).toLong()) }
+-            return mapOf("ok" to (scanText != null), "text" to scanText)
+-        } catch (t: Throwable) {
+-            Log.w(TAG, "scanQrOnce failed: ${t.message}")
+-            return mapOf("ok" to false, "reason" to "error")
+-        } finally {
+-            try { if (bound && conn != null) ctx.unbindService(conn) } catch (_: Throwable) {}
++    /** Unbinds and clears the shared scanner service (on error/lifecycle end). */
++    private fun releaseScannerService() {
++        synchronized(scanLock) {
++            val ctx = appContext
++            val conn = scanConn
++            if (scanBound && conn != null && ctx != null) {
++                try { ctx.unbindService(conn) } catch (_: Throwable) {}
++            }
++            scanConn = null
++            scanService = null
++            scanBound = false
+         }
+     }
+ 
+diff --git a/lib/validator_screen.dart b/lib/validator_screen.dart
+index 8531172..eb3a551 100644
+--- a/lib/validator_screen.dart
++++ b/lib/validator_screen.dart
+@@ -126,6 +126,10 @@ class _ValidatorScreenState extends State<ValidatorScreen>
+       // If no hardware at all (web / normal phone), idle politely.
+       if (!_caps.nfc && !_caps.scanner) {
+         await Future.delayed(const Duration(milliseconds: 600));
++      } else {
++        // Small breather between cycles: lets the UI thread render the
++        // idle animations smoothly and keeps CPU/heat low on the 24/7 device.
++        await Future.delayed(const Duration(milliseconds: 120));
+       }
+     }
+   }
+-- 
+2.39.5
+

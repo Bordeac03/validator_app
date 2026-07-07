@@ -1,0 +1,134 @@
+From a1e14386bf587beeaf31227595fa22796768ff82 Mon Sep 17 00:00:00 2001
+From: genspark_dev <genspark_dev@genspark.ai>
+Date: Tue, 7 Jul 2026 20:58:30 +0000
+Subject: [PATCH] Fix RF poll timeout after 1st read: detach() was wrong (card
+ not connected on UID read -> DeviceException(-1) wedged the reader). Replace
+ with releaseSearchSession() = waitForCardAbsent + native
+ RFCardInterface.searchEnd() to properly close the search session so the next
+ waitForCardPresent works
+
+---
+ .../ValidatorHardwarePlugin.kt                | 91 +++++++++----------
+ 1 file changed, 44 insertions(+), 47 deletions(-)
+
+diff --git a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+index c044b91..c689b3d 100644
+--- a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
++++ b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+@@ -283,30 +283,39 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     }
+ 
+     /**
+-     * Releases (detaches) the currently-attached RF card so the reader can
+-     * search for the next one. This is the key to repeated reads: without it
+-     * the reader stays latched to the first card and never reports another
+-     * "present" event. Tries the public detach()/searchEnd()/halt() variants
+-     * that exist across CloudPOS SDK builds; all best-effort.
++     * Ends the native "search" session opened by waitForCardPresent() so the
++     * next waitForCardPresent() can start a fresh search. For a UID-only read
++     * the public + correct way is waitForCardPresent -> waitForCardAbsent; the
++     * latter releases the search once the card leaves the field. As a hard
++     * safety net (e.g. the card is left on the reader) we also call the native
++     * RFCardInterface.searchEnd() reflectively, which forcibly closes the
++     * session so we never wedge on "no card / timeout" forever.
+      */
+-    private fun detachRfCard(device: Any, cls: Class<*>) {
+-        var detached = false
+-        for (m in listOf("detach", "searchEnd", "halt", "reset")) {
+-            try {
+-                cls.getMethod(m).invoke(device)
+-                detached = true
+-                Log.d(TAG, "RF: $m() ok")
+-                break
+-            } catch (_: NoSuchMethodException) {
+-                // try next name
+-            } catch (t: Throwable) {
+-                // Method exists but threw — still counts as an attempt.
+-                Log.d(TAG, "RF: $m() note: ${t.message}")
+-                detached = true
+-                break
+-            }
++    private fun releaseSearchSession(device: Any, cls: Class<*>) {
++        // 1) Preferred: wait for the card to leave (also ends the search).
++        var ended = false
++        try {
++            cls.getMethod("waitForCardAbsent", Int::class.javaPrimitiveType)
++                .invoke(device, 1200)
++            ended = true
++            Log.d(TAG, "RF: waitForCardAbsent ok")
++        } catch (t: Throwable) {
++            Log.d(TAG, "RF: waitForCardAbsent note: ${t.message}")
++        }
++        // 2) Hard reset of the native search session regardless, so a held card
++        //    can't keep the session open and starve the next poll.
++        try {
++            val rfIf = Class.forName("com.cloudpos.jniinterface.RFCardInterface")
++            rfIf.getMethod("searchEnd").invoke(null)
++            Log.d(TAG, "RF: native searchEnd ok")
++            ended = true
++        } catch (t: Throwable) {
++            Log.d(TAG, "RF: native searchEnd note: ${t.message}")
++        }
++        if (!ended) {
++            // Last resort: brief settle so we don't hammer a wedged session.
++            try { Thread.sleep(250) } catch (_: InterruptedException) {}
+         }
+-        if (!detached) Log.d(TAG, "RF: no detach-style method found")
+     }
+ 
+     /**
+@@ -353,16 +362,19 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+             rfDiag = "CARD READ ok uid=$uid type=$cardType"
+             Log.i(TAG, "RF: $rfDiag")
+ 
+-            // CRITICAL for repeated reads. After waitForCardPresent() the card
+-            // is ATTACHED (activated) to the reader. Until it is DETACHED the
+-            // reader stays busy with that card and searchBegin() for the next
+-            // waitForCardPresent() never reports a new "present" event — so it
+-            // "scans once and then stops". The correct CloudPOS flow is:
+-            //   waitForCardPresent -> getCard -> use -> detach() -> ready again.
+-            detachRfCard(device, deviceCls)
+-            // Then let the physical card leave the field so we don't instantly
+-            // re-read the same one while it's still on the reader.
+-            waitForCardAbsent(device, deviceCls)
++            // CRITICAL for repeated reads. waitForCardPresent() opens a native
++            // "search" session (RFCardInterface.searchBegin) and does NOT close
++            // it. The ONLY thing that properly ends that session for a UID-only
++            // read is waitForCardAbsent() — it waits for the card to leave and
++            // internally releases the search so the NEXT waitForCardPresent()
++            // can searchBegin() cleanly. (detach() is the wrong call here: for a
++            // UID read the card is never "connected", so detach() throws
++            // DeviceException(-1) and leaves the reader wedged -> every later
++            // poll returns "no card / timeout". That was the regression.)
++            //
++            // We give waitForCardAbsent a generous window so it still completes
++            // even if the user holds the card on the reader for a moment.
++            releaseSearchSession(device, deviceCls)
+             lastUid = uid
+ 
+             mapOf("ok" to true, "uid" to uid, "cardType" to cardType)
+@@ -389,21 +401,6 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+         Class.forName("com.cloudpos.OperationResult").getField("ERR_TIMEOUT").getInt(null)
+     } catch (_: Throwable) { -4 }
+ 
+-    /**
+-     * Best-effort wait for the card to leave the RF field, capped so we never
+-     * block the poll loop for long. Tries waitForCardAbsent(int) then
+-     * removeCard(); ignored if neither exists in this SDK build.
+-     */
+-    private fun waitForCardAbsent(device: Any, cls: Class<*>) {
+-        try {
+-            cls.getMethod("waitForCardAbsent", Int::class.javaPrimitiveType)
+-                .invoke(device, 800)
+-            return
+-        } catch (_: Throwable) { /* try next */ }
+-        // No waitForCardAbsent — settle briefly so the same tap isn't re-read.
+-        try { Thread.sleep(300) } catch (_: InterruptedException) {}
+-    }
+-
+     private fun fail(reason: String) = mapOf("ok" to false, "uid" to null, "reason" to reason)
+ 
+     /**
+-- 
+2.39.5
+

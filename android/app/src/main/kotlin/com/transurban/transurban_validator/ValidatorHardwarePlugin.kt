@@ -51,9 +51,16 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
         private const val TAG = "ValidatorHW"
         private const val CHANNEL = "transurban/validator"
 
-        // Real device-name string used by the working BusPassDemo (NOT the
-        // "com.cloudpos.device.*" form shown in the JavaDoc).
-        private const val RF_DEVICE_NAME = "cloudpos.device.rfcardreader"
+        // Official CloudPOS RF reader device name. NOTE the "com." prefix — an
+        // earlier build used "cloudpos.device.rfcardreader" (no prefix) which
+        // getDevice() does not recognise, so the reader was never obtained.
+        // We resolve POSTerminal.DEVICE_NAME_RF_CARD_READER reflectively at
+        // runtime and only fall back to these literals.
+        private const val RF_DEVICE_NAME = "com.cloudpos.device.rfcardreader"
+        private val RF_DEVICE_NAME_CANDIDATES = listOf(
+            "com.cloudpos.device.rfcardreader",
+            "cloudpos.device.rfcardreader",
+        )
 
         private const val SCAN_PKG = "com.cloudpos.scanserver"
         private const val SCAN_CLS = "com.cloudpos.scanserver.service.ScannerService"
@@ -66,6 +73,30 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
     private val io = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
 
+    // ---- Persistent scanner service (bound ONCE, reused for every scan) ----
+    // Binding/unbinding on every scan (every ~2.5s) leaked ServiceConnections
+    // and eventually crashed the app; and calling scanBarcode() inside
+    // onServiceConnected blocked the main Binder thread => ANR. We now keep a
+    // single long-lived connection and only ever run scanBarcode() on the
+    // background `io` executor.
+    private val scanLock = Object()
+    private var scanConn: ServiceConnection? = null
+    @Volatile private var scanService: IScanService? = null
+    @Volatile private var scanBound = false
+
+    // ---- Persistent RF card reader (opened ONCE, reused for every read) ----
+    // The CloudPOS RF reader is a process singleton over a native JNI layer.
+    // We open it ONCE (cached in rfDevice) and, after every read, end the
+    // native search session via waitForCardAbsent() so the next poll can search
+    // again. rfLock serializes every RF operation so two poll cycles never race
+    // on the shared native lock. See the big comment above readNfcOnce().
+    private val rfLock = Object()
+    @Volatile private var rfDevice: Any? = null
+    @Volatile private var rfDeviceCls: Class<*>? = null
+    // Human-readable trace of the last RF init/read so the Flutter UI (and
+    // logcat) can show WHERE it fails on the real WizarPOS device.
+    @Volatile private var rfDiag: String = "not started"
+
     // ---- FlutterPlugin ----
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         appContext = binding.applicationContext
@@ -77,6 +108,10 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel?.setMethodCallHandler(null)
         channel = null
+        // Release shared hardware handles so we never leak them.
+        releaseScannerService()
+        recycleRfDevice()
+        io.shutdownNow()
     }
 
     // ---- ActivityAware ----
@@ -105,6 +140,20 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
             }
             "startKiosk" -> result.success(setKiosk(true))
             "stopKiosk" -> result.success(setKiosk(false))
+            "warmUpNfc" -> io.execute {
+                // Pre-open the RF reader + clear any stale search session so the
+                // very first poll after boot doesn't hit "no open window".
+                warmUpRf()
+                val d = rfDiag
+                main.post { result.success(d) }
+            }
+            "nfcDiag" -> io.execute {
+                // Force an open attempt so the diag reflects the real device
+                // state (device found? opened ok?) without needing a card.
+                synchronized(rfLock) { ensureRfDevice() }
+                val d = rfDiag
+                main.post { result.success(d) }
+            }
             else -> result.notImplemented()
         }
     }
@@ -132,68 +181,283 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
 
     // -------------------- NFC / contactless (reflection) --------------------
 
+    // ============================================================
+    // WHY THE READER "READ ONCE THEN STOPPED" (root cause, from AAR bytecode)
+    // ------------------------------------------------------------
+    // RFCardReaderDeviceImpl is a *process singleton* wrapping the native JNI
+    // layer (com.cloudpos.jniinterface.RFCardInterface, guarded by a static
+    // rfcardinterfaceLock). getDevice() ALWAYS returns the same object, so
+    // "open a fresh handle per read" is an illusion — you get the same singleton
+    // with the same stale native search state.
+    //
+    // waitForCardPresent() internally does: clear() -> searchBegin() ->
+    // waitUntilCardPresent() -> getCard(). It NEVER calls searchEnd() on the
+    // success path. The ONLY correct way to end that native search session is
+    // the device's own waitForCardAbsent(), which (via checkSearchEndEvent)
+    // calls the *member* searchEnd() that properly balances searchBegin().
+    //
+    // Two earlier mistakes:
+    //  * close()/reopen per read — close() calls checkNotOpened() and tears down
+    //    native state in a way that then failed the next searchBegin().
+    //  * calling the *static native* RFCardInterface.searchEnd() directly — it
+    //    corrupted the singleton's bookkeeping so nothing scanned at all.
+    //
+    // Correct pattern (this version):
+    //  1) open the singleton ONCE (cached), skipRATS.
+    //  2) each cycle: waitForCardPresent -> read UID -> waitForCardAbsent()
+    //     (short timeout) to cleanly close the search session so the NEXT
+    //     waitForCardPresent can searchBegin() again.
+    //  3) only on a *hard* error do we close()+reopen to fully recover.
+    // ============================================================
+
     /**
-     * Opens the RF reader, waits up to [timeoutMs] for a single card, reads its
-     * UID, then closes. Mirrors BusPassDemo's CycleWaitThread but for one shot.
-     * All SDK access via reflection so the module never hard-depends on the AAR.
+     * Returns the cached, already-open RF singleton, opening it once if needed.
+     * Runs under rfLock on the io thread. Returns null (and sets rfDiag) when
+     * the SDK / device is unavailable.
      */
-    private fun readNfcOnce(timeoutMs: Int): Map<String, Any?> {
-        val ctx = appContext ?: return fail("no_context")
-        var device: Any? = null
-        return try {
+    private fun ensureRfDevice(): Any? {
+        rfDevice?.let { return it }
+        val ctx = appContext ?: run { rfDiag = "no_context"; return null }
+        try {
             val posTerminalCls = Class.forName("com.cloudpos.POSTerminal")
             val getInstance = posTerminalCls.getMethod("getInstance", Context::class.java)
             val terminal = getInstance.invoke(null, ctx)
-            val getDevice = posTerminalCls.getMethod("getDevice", String::class.java)
-            device = getDevice.invoke(terminal, RF_DEVICE_NAME)
-                ?: return fail("no_device")
+                ?: run { rfDiag = "POSTerminal.getInstance()=null"; return null }
 
+            // Prefer the SDK's own DEVICE_NAME_RF_CARD_READER constant, then fall
+            // back to our known-name candidates.
+            val names = LinkedHashSet<String>()
+            try {
+                (posTerminalCls.getField("DEVICE_NAME_RF_CARD_READER").get(null) as? String)
+                    ?.let { names.add(it) }
+            } catch (_: Throwable) {}
+            names.addAll(RF_DEVICE_NAME_CANDIDATES)
+
+            val getDevice = posTerminalCls.getMethod("getDevice", String::class.java)
+            var device: Any? = null
+            var usedName = ""
+            for (n in names) {
+                try {
+                    val d = getDevice.invoke(terminal, n)
+                    if (d != null) { device = d; usedName = n; break }
+                } catch (e: Throwable) {
+                    Log.d(TAG, "getDevice('$n') threw: ${e.message}")
+                }
+            }
+            if (device == null) {
+                val listed = try {
+                    (posTerminalCls.getMethod("listDevices").invoke(terminal) as? Array<*>)
+                        ?.joinToString(",") { it.toString() } ?: "?"
+                } catch (_: Throwable) { "listDevices_unavailable" }
+                rfDiag = "getDevice null for all names; listDevices=[$listed]"
+                Log.w(TAG, "RF: $rfDiag")
+                return null
+            }
             val deviceCls = device.javaClass
-            // open()  (no-arg form, as used in the working demo)
+
+            // Open the reader. no-arg open() delegates to open(0,0)=MODE_AUTO.
+            // Already-open is benign — keep the handle.
             try {
                 deviceCls.getMethod("open").invoke(device)
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                Log.d(TAG, "rf open() note: ${e.targetException?.message}") // likely already open
             } catch (_: NoSuchMethodException) {
-                // fall back to open(int, int) with logicalID 0 + MODE_AUTO(0)
-                deviceCls.getMethod("open", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
-                    .invoke(device, 0, 0)
+                try {
+                    deviceCls.getMethod(
+                        "open",
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType
+                    ).invoke(device, 0, 0)
+                } catch (e: java.lang.reflect.InvocationTargetException) {
+                    Log.d(TAG, "rf open(0,0) note: ${e.targetException?.message}")
+                }
             }
 
-            // --- SDK 1.8.2.24 optimizations (all best-effort, ignored if absent) ---
-            // skipRATS(): avoid entering ISO14443-4, faster UID-only reads for transit.
+            // Best-effort: faster UID reads (skip RATS handshake).
             invokeOptional(device, deviceCls, "skipRATS")
-            // enableLowPowerCardDetect(): the validator is mounted 24/7, save power.
-            invokeOptional(device, deviceCls, "enableLowPowerCardDetect")
 
-            val waitForCardPresent = deviceCls.getMethod(
-                "waitForCardPresent", Int::class.javaPrimitiveType
-            )
-            val opResult = waitForCardPresent.invoke(device, timeoutMs)
-                ?: return fail("timeout")
-
-            // OperationResult.getResultCode() == OperationResult.SUCCESS (0)
-            val resultCode = opResult.javaClass.getMethod("getResultCode").invoke(opResult) as? Int
-            if (resultCode != 0) return fail("no_card")
-
-            val card = opResult.javaClass.getMethod("getCard").invoke(opResult)
-                ?: return fail("no_card")
-            val idBytes = card.javaClass.getMethod("getID").invoke(card) as? ByteArray
-            val uid = idBytes?.joinToString("") { "%02X".format(it) } ?: ""
-
-            // getCardTypeValue(): int[] describing detected card technology (1.7.7+).
-            val cardType = readCardType(device, deviceCls)
-
-            mapOf("ok" to uid.isNotEmpty(), "uid" to uid, "cardType" to cardType)
+            rfDevice = device
+            rfDeviceCls = deviceCls
+            if (rfDiag == "not started" || rfDiag.startsWith("getDevice null") ||
+                rfDiag.startsWith("ensureRfDevice error") || rfDiag.startsWith("open error")) {
+                rfDiag = "open ok via '$usedName'"
+            }
+            Log.i(TAG, "RF: opened via '$usedName' -> ${deviceCls.name}")
+            return device
         } catch (t: Throwable) {
-            Log.w(TAG, "readNfcOnce failed: ${t.message}")
-            fail(if (t is ClassNotFoundException) "unavailable" else "error")
-        } finally {
+            rfDiag = "ensureRfDevice error: ${t.javaClass.simpleName}: ${t.message}"
+            Log.w(TAG, rfDiag)
+            return null
+        }
+    }
+
+    /** Fully closes + clears the cached RF singleton so the next read reopens. */
+    private fun recycleRfDevice() {
+        synchronized(rfLock) {
+            val device = rfDevice
             if (device != null) {
-                // Revert low-power mode then close, both best-effort.
-                invokeOptional(device, device.javaClass, "disableLowPowerCardDetect")
-                try { device.javaClass.getMethod("close").invoke(device) } catch (_: Throwable) {}
+                try { device.javaClass.getMethod("close").invoke(device) } catch (t: Throwable) {
+                    Log.d(TAG, "RF: close note: ${t.message}")
+                }
+            }
+            rfDevice = null
+            rfDeviceCls = null
+        }
+    }
+
+    /**
+     * Ends the native search session started by waitForCardPresent() by calling
+     * the SDK's OWN private *member* searchEnd() reflectively.
+     *
+     * Why the member (not the static native, not waitForCardAbsent):
+     *  - RFCardReaderDeviceImpl.searchEnd() (private, no state guard) does
+     *    exactly: RFCardInterface.searchEnd() + throwsExceptionByErrorResult().
+     *    This is precisely what cancelRequest()/the absent path run internally
+     *    to balance searchBegin(). Calling it directly is the safe, quiescent
+     *    way to end the search.
+     *  - The static native RFCardInterface.searchEnd() (patch 8) skipped the
+     *    error-result handling and desynced the wrapper -> nothing scanned.
+     *  - waitForCardAbsent() only reaches searchEnd() while the card is still
+     *    present; if the card was already lifted it loops+times out WITHOUT
+     *    ending the search -> reader wedged after the 1st read. That was the
+     *    "reads once then stops" regression.
+     *  - cancelRequest() throws (-4) when idle (checkNotRun requires an active
+     *    wait), so it can't be used here either.
+     */
+    private fun endSearchSession(device: Any, cls: Class<*>) {
+        try {
+            val m = findDeclaredMethod(cls, "searchEnd")
+            if (m != null) {
+                m.isAccessible = true
+                m.invoke(device)
+                Log.d(TAG, "RF: member searchEnd ok (search ended)")
+            } else {
+                // Fallback: the raw native searchEnd. Less ideal (no wrapper
+                // bookkeeping) but better than leaving the search open.
+                Class.forName("com.cloudpos.jniinterface.RFCardInterface")
+                    .getMethod("searchEnd").invoke(null)
+                Log.d(TAG, "RF: native searchEnd fallback ok")
+            }
+        } catch (t: Throwable) {
+            // If ending the search fails we can't trust the native state —
+            // recycle so the next cycle reopens cleanly instead of wedging.
+            Log.d(TAG, "RF: searchEnd note: ${t.message} -> recycling")
+            recycleRfDevice()
+        }
+    }
+
+    /**
+     * Finds a declared method by name on [cls] or any superclass (needed for
+     * the private searchEnd() on RFCardReaderDeviceImpl, which getMethod()
+     * can't see). Ignores parameter types (searchEnd is no-arg).
+     */
+    private fun findDeclaredMethod(cls: Class<*>, name: String): java.lang.reflect.Method? {
+        var c: Class<*>? = cls
+        while (c != null) {
+            try {
+                return c.getDeclaredMethod(name)
+            } catch (_: NoSuchMethodException) {
+                c = c.superclass
+            }
+        }
+        return null
+    }
+
+    /**
+     * Best-effort warm-up: open the RF singleton ahead of time and immediately
+     * end any residual search session, so the FIRST real poll after boot isn't
+     * the one that hits an uninitialised reader ("no open window"). Safe to call
+     * repeatedly; runs under rfLock on the io thread.
+     */
+    private fun warmUpRf() {
+        synchronized(rfLock) {
+            val device = ensureRfDevice() ?: return
+            val cls = rfDeviceCls ?: device.javaClass
+            // Clear any stale native search state left from a previous process
+            // instance, then leave the reader open and idle, ready to poll.
+            endSearchSession(device, cls)
+            Log.i(TAG, "RF: warm-up complete ($rfDiag)")
+        }
+    }
+
+    /**
+     * Waits up to [timeoutMs] for a single card on the cached (open) RF
+     * singleton, reads UID + type, then ends the native search session via the
+     * private member searchEnd() (see endSearchSession) so the NEXT poll can
+     * searchBegin() again. Without this the reader reads exactly once and then
+     * never again.
+     *
+     * Always invoked from the background io thread (see onMethodCall), so the
+     * blocking calls never touch the UI thread — no ANR.
+     */
+    private fun readNfcOnce(timeoutMs: Int): Map<String, Any?> {
+        synchronized(rfLock) {
+            val device = ensureRfDevice() ?: return fail("unavailable")
+            val deviceCls = rfDeviceCls ?: device.javaClass
+            return try {
+                val opResult = deviceCls
+                    .getMethod("waitForCardPresent", Int::class.javaPrimitiveType)
+                    .invoke(device, timeoutMs)
+                    ?: run { rfDiag = "poll timeout (no card in window)"; return fail("timeout") }
+
+                // CloudPOS OperationResult.SUCCESS == 1 (0 == NONE/idle).
+                val resultCode = (opResult.javaClass.getMethod("getResultCode").invoke(opResult) as? Int) ?: -1
+                val successCode = operationSuccessCode()   // == 1 on this SDK
+                Log.d(TAG, "RF: waitForCardPresent resultCode=$resultCode (success=$successCode)")
+                if (resultCode != successCode && resultCode == operationTimeoutCode()) {
+                    rfDiag = "poll timeout (no card in window)"
+                    // Nothing was found, but searchBegin() DID run inside
+                    // waitForCardPresent — balance it so the next poll is clean.
+                    endSearchSession(device, deviceCls)
+                    return fail("timeout")
+                }
+
+                val card = opResult.javaClass.getMethod("getCard").invoke(opResult)
+                    ?: run {
+                        rfDiag = "resultCode=$resultCode but getCard()=null"
+                        endSearchSession(device, deviceCls)
+                        return fail("no_card")
+                    }
+                val idBytes = card.javaClass.getMethod("getID").invoke(card) as? ByteArray
+                val uid = idBytes?.joinToString("") { "%02X".format(it) } ?: ""
+                if (uid.isEmpty()) {
+                    rfDiag = "card present but empty UID"
+                    endSearchSession(device, deviceCls)
+                    return fail("no_card")
+                }
+
+                val cardType = readCardType(device, deviceCls)
+                rfDiag = "CARD READ ok uid=$uid type=$cardType"
+                Log.i(TAG, "RF: $rfDiag")
+
+                // CRITICAL: end the search session the SDK-sanctioned way so the
+                // NEXT waitForCardPresent() can start a fresh search. Without
+                // this the reader reads exactly once and then never again.
+                endSearchSession(device, deviceCls)
+
+                mapOf("ok" to true, "uid" to uid, "cardType" to cardType)
+            } catch (t: Throwable) {
+                rfDiag = "readNfcOnce error: ${t.javaClass.simpleName}: ${t.message}"
+                Log.w(TAG, rfDiag)
+                // Hard failure -> drop the handle so the next read reopens clean.
+                recycleRfDevice()
+                fail(if (t is ClassNotFoundException) "unavailable" else "error")
             }
         }
     }
+
+    /**
+     * Reads com.cloudpos.OperationResult.SUCCESS reflectively. On CloudPOS
+     * SDK 1.8.2.24 this is 1 (0 is NONE). Falls back to 1 if unavailable.
+     */
+    private fun operationSuccessCode(): Int = try {
+        Class.forName("com.cloudpos.OperationResult").getField("SUCCESS").getInt(null)
+    } catch (_: Throwable) { 1 }
+
+    /** com.cloudpos.OperationResult.ERR_TIMEOUT (== -4). Fallback -4. */
+    private fun operationTimeoutCode(): Int = try {
+        Class.forName("com.cloudpos.OperationResult").getField("ERR_TIMEOUT").getInt(null)
+    } catch (_: Throwable) { -4 }
 
     private fun fail(reason: String) = mapOf("ok" to false, "uid" to null, "reason" to reason)
 
@@ -235,65 +499,121 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
     // -------------------- QR scanner (system AIDL service) --------------------
 
     /**
-     * Binds the CloudPOS scanner service and performs ONE blocking scan.
-     * Returns the decoded text or ok:false on timeout/unavailable.
+     * Performs ONE scan using the shared, long-lived scanner service.
+     *
+     * IMPORTANT: this method is always invoked from the background `io`
+     * executor (see onMethodCall), so the blocking scanBarcode() call NEVER
+     * runs on the main/UI thread. The service is bound only once (lazily) and
+     * then reused for every subsequent scan, so there is no bind/unbind churn.
      */
     private fun scanQrOnce(timeoutMs: Int): Map<String, Any?> {
         val ctx = appContext ?: return mapOf("ok" to false, "reason" to "no_context")
         if (!isPackageInstalled(SCAN_PKG)) {
             return mapOf("ok" to false, "reason" to "unavailable")
         }
-        val lock = Object()
-        var bound = false
-        var scanText: String? = null
-        var conn: ServiceConnection? = null
-        try {
-            conn = object : ServiceConnection {
-                override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-                    try {
-                        val desc = service?.interfaceDescriptor
-                        if (desc == SCAN_DESC && service != null) {
-                            val scanService = IScanService.Stub.asInterface(service)
-                            val p = ScanParameter()
-                            // Headless, driver-less scan: no on-screen scanner UI,
-                            // the validator's own Flutter screen stays visible.
-                            p.set(ScanParameter.KEY_UI_WINDOW_WIDTH, 0)
-                            p.set(ScanParameter.KEY_UI_WINDOW_HEIGHT, 0)
-                            p.set(ScanParameter.KEY_SCAN_MODE, "overlay")
-                            p.set(ScanParameter.KEY_ENABLE_MIRROR_SCAN, true)
-                            p.set(ScanParameter.KEY_SCAN_TIME_OUT, timeoutMs)
-                            // Suppress the built-in scanner beep (we give our own
-                            // audio/visual feedback in Flutter) and hide any UI.
-                            trySet(p, "KEY_ENABLE_SOUND", false)
-                            trySet(p, "KEY_DISABLE_UI", true)
-                            val res: ScanResult? = scanService.scanBarcode(p)
-                            if (res != null && res.resultCode == ScanResult.SCAN_SUCCESS) {
-                                // getText() = the decoded barcode payload
-                                // (res.toString() would return the object dump).
-                                val decoded = res.text
-                                if (!decoded.isNullOrBlank()) scanText = decoded.trim()
-                            }
-                        }
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "scan onConnected failed: ${t.message}")
-                    } finally {
-                        synchronized(lock) { lock.notifyAll() }
-                    }
-                }
-                override fun onServiceDisconnected(name: ComponentName?) {}
-            }
-            val intent = Intent().apply { component = ComponentName(SCAN_PKG, SCAN_CLS) }
-            bound = ctx.bindService(intent, conn, Context.BIND_AUTO_CREATE)
-            ctx.startService(intent)
-            if (!bound) return mapOf("ok" to false, "reason" to "bind_failed")
 
-            synchronized(lock) { lock.wait((timeoutMs + 3000).toLong()) }
-            return mapOf("ok" to (scanText != null), "text" to scanText)
+        // Ensure the service is bound (blocks the background thread, not UI).
+        val svc = ensureScannerService()
+            ?: return mapOf("ok" to false, "reason" to "bind_failed")
+
+        return try {
+            val p = ScanParameter()
+            // Headless, driver-less scan: no on-screen scanner UI,
+            // the validator's own Flutter screen stays visible.
+            p.set(ScanParameter.KEY_UI_WINDOW_WIDTH, 0)
+            p.set(ScanParameter.KEY_UI_WINDOW_HEIGHT, 0)
+            p.set(ScanParameter.KEY_SCAN_MODE, "overlay")
+            p.set(ScanParameter.KEY_ENABLE_MIRROR_SCAN, true)
+            p.set(ScanParameter.KEY_SCAN_TIME_OUT, timeoutMs)
+            // Suppress the built-in scanner beep (we give our own
+            // audio/visual feedback in Flutter) and hide any UI.
+            trySet(p, "KEY_ENABLE_SOUND", false)
+            trySet(p, "KEY_DISABLE_UI", true)
+
+            // Blocking call - safe here because we are on the io thread.
+            val res: ScanResult? = svc.scanBarcode(p)
+            if (res != null && res.resultCode == ScanResult.SCAN_SUCCESS) {
+                val decoded = res.text
+                if (!decoded.isNullOrBlank()) {
+                    return mapOf("ok" to true, "text" to decoded.trim())
+                }
+            }
+            mapOf("ok" to false, "text" to null)
         } catch (t: Throwable) {
             Log.w(TAG, "scanQrOnce failed: ${t.message}")
-            return mapOf("ok" to false, "reason" to "error")
-        } finally {
-            try { if (bound && conn != null) ctx.unbindService(conn) } catch (_: Throwable) {}
+            // The service may have died (process restart); drop the cached
+            // reference so the next call rebinds cleanly.
+            if (t is android.os.DeadObjectException || t is android.os.RemoteException) {
+                releaseScannerService()
+            }
+            mapOf("ok" to false, "reason" to "error")
+        }
+    }
+
+    /**
+     * Lazily binds the CloudPOS scanner AIDL service ONCE and caches the
+     * IScanService. Called from the background io thread; blocks up to ~5s for
+     * the connection to be established the first time, then returns the cached
+     * instance instantly for every subsequent scan.
+     */
+    private fun ensureScannerService(): IScanService? {
+        scanService?.let { return it }
+        val ctx = appContext ?: return null
+        synchronized(scanLock) {
+            // Double-checked: another thread may have bound while we waited.
+            scanService?.let { return it }
+            if (scanConn == null) {
+                val conn = object : ServiceConnection {
+                    override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                        synchronized(scanLock) {
+                            scanService = try {
+                                if (service != null) IScanService.Stub.asInterface(service) else null
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "asInterface failed: ${t.message}")
+                                null
+                            }
+                            scanLock.notifyAll()
+                        }
+                    }
+                    override fun onServiceDisconnected(name: ComponentName?) {
+                        synchronized(scanLock) {
+                            scanService = null
+                            scanLock.notifyAll()
+                        }
+                    }
+                }
+                scanConn = conn
+                val intent = Intent().apply { component = ComponentName(SCAN_PKG, SCAN_CLS) }
+                scanBound = try {
+                    ctx.bindService(intent, conn, Context.BIND_AUTO_CREATE)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "bindService failed: ${t.message}")
+                    false
+                }
+                if (!scanBound) {
+                    scanConn = null
+                    return null
+                }
+            }
+            // Wait for onServiceConnected (only the first time).
+            if (scanService == null) {
+                try { scanLock.wait(5000) } catch (_: InterruptedException) {}
+            }
+            return scanService
+        }
+    }
+
+    /** Unbinds and clears the shared scanner service (on error/lifecycle end). */
+    private fun releaseScannerService() {
+        synchronized(scanLock) {
+            val ctx = appContext
+            val conn = scanConn
+            if (scanBound && conn != null && ctx != null) {
+                try { ctx.unbindService(conn) } catch (_: Throwable) {}
+            }
+            scanConn = null
+            scanService = null
+            scanBound = false
         }
     }
 

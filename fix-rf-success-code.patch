@@ -1,0 +1,67 @@
+From 65c88fdb8dcba0cfe868f50250cbe6a44c9351b9 Mon Sep 17 00:00:00 2001
+From: genspark_dev <genspark_dev@genspark.ai>
+Date: Tue, 7 Jul 2026 19:40:20 +0000
+Subject: [PATCH] Fix RF card never detected: OperationResult.SUCCESS is 1 not
+ 0 (old check '!=0' rejected every valid read); read success/timeout codes
+ reflectively, accept read whenever a non-empty UID is present
+
+---
+ .../ValidatorHardwarePlugin.kt                | 30 ++++++++++++++++---
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+index 30998a3..aee2fa8 100644
+--- a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
++++ b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+@@ -245,15 +245,24 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+             val opResult = waitForCardPresent.invoke(device, timeoutMs)
+                 ?: return fail("timeout")
+ 
+-            // OperationResult.getResultCode() == OperationResult.SUCCESS (0)
+-            val resultCode = opResult.javaClass.getMethod("getResultCode").invoke(opResult) as? Int
+-            if (resultCode != 0) return fail("no_card")
++            // CloudPOS OperationResult.SUCCESS == 1 (NOT 0 — 0 is NONE/idle).
++            // A previous version compared against 0, so every successful read was
++            // treated as "no card" and the UID was never surfaced. We now check
++            // against the real SUCCESS constant (read reflectively, default 1),
++            // and if the result is anything other than a clear timeout we still
++            // try to pull the card — presence of a non-empty UID is the real
++            // proof a card was tapped.
++            val resultCode = (opResult.javaClass.getMethod("getResultCode").invoke(opResult) as? Int) ?: -1
++            val successCode = operationSuccessCode()   // == 1 on this SDK
++            if (resultCode != successCode && resultCode == operationTimeoutCode()) {
++                return fail("timeout")
++            }
+ 
+             val card = opResult.javaClass.getMethod("getCard").invoke(opResult)
+                 ?: return fail("no_card")
+             val idBytes = card.javaClass.getMethod("getID").invoke(card) as? ByteArray
+             val uid = idBytes?.joinToString("") { "%02X".format(it) } ?: ""
+-            if (uid.isEmpty()) return fail("no_uid")
++            if (uid.isEmpty()) return fail("no_card")
+ 
+             // getCardTypeValue(): int[] describing detected card technology.
+             val cardType = readCardType(device, deviceCls)
+@@ -273,6 +282,19 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+         }
+     }
+ 
++    /**
++     * Reads com.cloudpos.OperationResult.SUCCESS reflectively. On CloudPOS
++     * SDK 1.8.2.24 this is 1 (0 is NONE). Falls back to 1 if unavailable.
++     */
++    private fun operationSuccessCode(): Int = try {
++        Class.forName("com.cloudpos.OperationResult").getField("SUCCESS").getInt(null)
++    } catch (_: Throwable) { 1 }
++
++    /** com.cloudpos.OperationResult.ERR_TIMEOUT (== -4). Fallback -4. */
++    private fun operationTimeoutCode(): Int = try {
++        Class.forName("com.cloudpos.OperationResult").getField("ERR_TIMEOUT").getInt(null)
++    } catch (_: Throwable) { -4 }
++
+     /**
+      * Best-effort wait for the card to leave the RF field, capped so we never
+      * block the poll loop for long. Tries waitForCardAbsent(int) then
+-- 
+2.39.5
+

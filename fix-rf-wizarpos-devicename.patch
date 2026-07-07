@@ -1,0 +1,296 @@
+From a4c76805a9a5102965a6bffeef407dc0d6159bfc Mon Sep 17 00:00:00 2001
+From: genspark_dev <genspark_dev@genspark.ai>
+Date: Tue, 7 Jul 2026 19:54:58 +0000
+Subject: [PATCH] Fix RF reader on WizarPOS: wrong device name
+ ('cloudpos.device.rfcardreader' missing 'com.' prefix) meant getDevice()
+ never returned the reader. Resolve DEVICE_NAME_RF_CARD_READER reflectively +
+ try candidates; add on-screen + logcat diagnostics (device list, open status,
+ timeout, UID) via nfcDiag
+
+---
+ .../ValidatorHardwarePlugin.kt                | 90 +++++++++++++++----
+ lib/validator_hardware.dart                   | 12 +++
+ lib/validator_screen.dart                     | 38 ++++++++
+ 3 files changed, 125 insertions(+), 15 deletions(-)
+
+diff --git a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+index aee2fa8..827163b 100644
+--- a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
++++ b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+@@ -51,9 +51,16 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+         private const val TAG = "ValidatorHW"
+         private const val CHANNEL = "transurban/validator"
+ 
+-        // Real device-name string used by the working BusPassDemo (NOT the
+-        // "com.cloudpos.device.*" form shown in the JavaDoc).
+-        private const val RF_DEVICE_NAME = "cloudpos.device.rfcardreader"
++        // Official CloudPOS RF reader device name. NOTE the "com." prefix — an
++        // earlier build used "cloudpos.device.rfcardreader" (no prefix) which
++        // getDevice() does not recognise, so the reader was never obtained.
++        // We resolve POSTerminal.DEVICE_NAME_RF_CARD_READER reflectively at
++        // runtime and only fall back to these literals.
++        private const val RF_DEVICE_NAME = "com.cloudpos.device.rfcardreader"
++        private val RF_DEVICE_NAME_CANDIDATES = listOf(
++            "com.cloudpos.device.rfcardreader",
++            "cloudpos.device.rfcardreader",
++        )
+ 
+         private const val SCAN_PKG = "com.cloudpos.scanserver"
+         private const val SCAN_CLS = "com.cloudpos.scanserver.service.ScannerService"
+@@ -88,6 +95,9 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     @Volatile private var rfDevice: Any? = null
+     @Volatile private var rfDeviceCls: Class<*>? = null
+     @Volatile private var lastUid: String? = null
++    // Human-readable trace of the last RF init/read so the Flutter UI (and
++    // logcat) can show WHERE it fails on the real WizarPOS device.
++    @Volatile private var rfDiag: String = "not started"
+ 
+     // ---- FlutterPlugin ----
+     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+@@ -132,6 +142,12 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+             }
+             "startKiosk" -> result.success(setKiosk(true))
+             "stopKiosk" -> result.success(setKiosk(false))
++            "nfcDiag" -> io.execute {
++                // Force an init attempt so the diag reflects the real device.
++                ensureRfDevice()
++                val d = rfDiag
++                main.post { result.success(d) }
++            }
+             else -> result.notImplemented()
+         }
+     }
+@@ -167,25 +183,60 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+      */
+     private fun ensureRfDevice(): Any? {
+         rfDevice?.let { return it }
+-        val ctx = appContext ?: return null
++        val ctx = appContext ?: run { rfDiag = "no_context"; return null }
+         synchronized(rfLock) {
+             rfDevice?.let { return it }
+             try {
+                 val posTerminalCls = Class.forName("com.cloudpos.POSTerminal")
+                 val getInstance = posTerminalCls.getMethod("getInstance", Context::class.java)
+                 val terminal = getInstance.invoke(null, ctx)
++                    ?: run { rfDiag = "POSTerminal.getInstance()=null"; return null }
++
++                // Build the list of device-name candidates, preferring the
++                // SDK's own DEVICE_NAME_RF_CARD_READER constant if present.
++                val names = LinkedHashSet<String>()
++                try {
++                    (posTerminalCls.getField("DEVICE_NAME_RF_CARD_READER").get(null) as? String)
++                        ?.let { names.add(it) }
++                } catch (_: Throwable) {}
++                names.addAll(RF_DEVICE_NAME_CANDIDATES)
++
++                // Log what devices the terminal actually exposes (huge help for
++                // debugging on the real WizarPOS).
++                val listed = try {
++                    (posTerminalCls.getMethod("listDevices").invoke(terminal) as? Array<*>)
++                        ?.joinToString(",") { it.toString() } ?: "?"
++                } catch (_: Throwable) { "listDevices_unavailable" }
++                Log.i(TAG, "RF: terminal devices = [$listed]")
++
+                 val getDevice = posTerminalCls.getMethod("getDevice", String::class.java)
+-                val device = getDevice.invoke(terminal, RF_DEVICE_NAME) ?: return null
++                var device: Any? = null
++                var usedName = ""
++                for (n in names) {
++                    try {
++                        val d = getDevice.invoke(terminal, n)
++                        if (d != null) { device = d; usedName = n; break }
++                    } catch (e: Throwable) {
++                        Log.d(TAG, "getDevice('$n') threw: ${e.message}")
++                    }
++                }
++                if (device == null) {
++                    rfDiag = "getDevice null for all names; listDevices=[$listed]"
++                    Log.w(TAG, "RF: $rfDiag")
++                    return null
++                }
+                 val deviceCls = device.javaClass
++                Log.i(TAG, "RF: got device via '$usedName' -> ${deviceCls.name}")
+ 
+-                // open() — no-arg form used by the working BusPassDemo; fall back
+-                // to open(int,int). If it's already open from a previous run the
+-                // SDK may throw DeviceException(-2) — treat that as "already open".
++                // Open the reader. no-arg open() delegates to open(0,0)=MODE_AUTO.
++                // Already-open is benign — keep the handle.
++                var opened = false
+                 try {
+                     deviceCls.getMethod("open").invoke(device)
++                    opened = true
+                 } catch (e: java.lang.reflect.InvocationTargetException) {
+-                    // Already-open / benign open failure: keep the handle anyway.
+                     Log.d(TAG, "rf open() note: ${e.targetException?.message}")
++                    opened = true // likely already open
+                 } catch (_: NoSuchMethodException) {
+                     try {
+                         deviceCls.getMethod(
+@@ -193,21 +244,25 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+                             Int::class.javaPrimitiveType,
+                             Int::class.javaPrimitiveType
+                         ).invoke(device, 0, 0)
++                        opened = true
+                     } catch (e: java.lang.reflect.InvocationTargetException) {
+                         Log.d(TAG, "rf open(0,0) note: ${e.targetException?.message}")
++                        opened = true
+                     }
+                 }
+ 
+-                // SDK 1.8.2.24 optimizations (best-effort, ignored if absent):
+-                // skipRATS() = faster UID-only reads; low-power detect for 24/7 use.
++                // SDK optimizations (best-effort): faster UID reads + low power.
+                 invokeOptional(device, deviceCls, "skipRATS")
+                 invokeOptional(device, deviceCls, "enableLowPowerCardDetect")
+ 
+                 rfDevice = device
+                 rfDeviceCls = deviceCls
++                rfDiag = "open ok via '$usedName' (opened=$opened)"
++                Log.i(TAG, "RF: $rfDiag")
+                 return device
+             } catch (t: Throwable) {
+-                Log.w(TAG, "ensureRfDevice failed: ${t.message}")
++                rfDiag = "ensureRfDevice error: ${t.javaClass.simpleName}: ${t.message}"
++                Log.w(TAG, rfDiag)
+                 return null
+             }
+         }
+@@ -254,18 +309,22 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+             // proof a card was tapped.
+             val resultCode = (opResult.javaClass.getMethod("getResultCode").invoke(opResult) as? Int) ?: -1
+             val successCode = operationSuccessCode()   // == 1 on this SDK
++            Log.d(TAG, "RF: waitForCardPresent resultCode=$resultCode (success=$successCode)")
+             if (resultCode != successCode && resultCode == operationTimeoutCode()) {
++                rfDiag = "poll timeout (no card in window)"
+                 return fail("timeout")
+             }
+ 
+             val card = opResult.javaClass.getMethod("getCard").invoke(opResult)
+-                ?: return fail("no_card")
++                ?: run { rfDiag = "resultCode=$resultCode but getCard()=null"; return fail("no_card") }
+             val idBytes = card.javaClass.getMethod("getID").invoke(card) as? ByteArray
+             val uid = idBytes?.joinToString("") { "%02X".format(it) } ?: ""
+-            if (uid.isEmpty()) return fail("no_card")
++            if (uid.isEmpty()) { rfDiag = "card present but empty UID"; return fail("no_card") }
+ 
+             // getCardTypeValue(): int[] describing detected card technology.
+             val cardType = readCardType(device, deviceCls)
++            rfDiag = "CARD READ ok uid=$uid type=$cardType"
++            Log.i(TAG, "RF: $rfDiag")
+ 
+             // Wait for the card to be removed so the loop doesn't fire the same
+             // UID on the very next cycle while the user keeps holding it.
+@@ -274,7 +333,8 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+ 
+             mapOf("ok" to true, "uid" to uid, "cardType" to cardType)
+         } catch (t: Throwable) {
+-            Log.w(TAG, "readNfcOnce failed: ${t.message}")
++            rfDiag = "readNfcOnce error: ${t.javaClass.simpleName}: ${t.message}"
++            Log.w(TAG, rfDiag)
+             // A hard failure may mean the device handle went stale — drop it so
+             // the next read reopens cleanly.
+             releaseRfDevice()
+diff --git a/lib/validator_hardware.dart b/lib/validator_hardware.dart
+index 1e929c1..e460286 100644
+--- a/lib/validator_hardware.dart
++++ b/lib/validator_hardware.dart
+@@ -125,6 +125,18 @@ class ValidatorHardware {
+     }
+   }
+ 
++  /// Returns a human-readable trace of the last RF init/read attempt, so the
++  /// UI can show WHERE NFC fails on the real WizarPOS (device list, open error,
++  /// timeout, etc.). Empty string on unsupported platforms.
++  Future<String> nfcDiag() async {
++    if (!isSupportedPlatform) return 'unsupported platform';
++    try {
++      return (await _channel.invokeMethod<String>('nfcDiag')) ?? '(null)';
++    } catch (e) {
++      return 'diag error: $e';
++    }
++  }
++
+   Future<bool> startKiosk() async {
+     if (!isSupportedPlatform) return false;
+     try {
+diff --git a/lib/validator_screen.dart b/lib/validator_screen.dart
+index eb3a551..c25f0b1 100644
+--- a/lib/validator_screen.dart
++++ b/lib/validator_screen.dart
+@@ -48,6 +48,7 @@ class _ValidatorScreenState extends State<ValidatorScreen>
+   ValidatorCapabilities _caps = ValidatorCapabilities.none;
+   bool _looping = false;
+   bool _busy = false;
++  String _diag = ''; // last NFC/RF diagnostic trace (hidden unless present)
+ 
+   late final AnimationController _pulse; // NFC ring pulse
+   late final AnimationController _breathe; // gentle status dot
+@@ -69,6 +70,7 @@ class _ValidatorScreenState extends State<ValidatorScreen>
+     WidgetsBinding.instance.addPostFrameCallback((_) async {
+       _caps = await _hw.capabilities();
+       await _hw.startKiosk(); // no-op unless provisioned as device owner
++      _diag = await _hw.nfcDiag(); // surface RF init status on screen
+       if (mounted) setState(() {});
+       _startLoop();
+     });
+@@ -121,6 +123,10 @@ class _ValidatorScreenState extends State<ValidatorScreen>
+           );
+           continue;
+         }
++        // Refresh the on-screen diagnostic so we can see why RF isn't firing
++        // (device list / open error / timeout) without needing adb logcat.
++        final d = await _hw.nfcDiag();
++        if (mounted && d != _diag) setState(() => _diag = d);
+       }
+ 
+       // If no hardware at all (web / normal phone), idle politely.
+@@ -293,6 +299,7 @@ class _ValidatorScreenState extends State<ValidatorScreen>
+                 _brandRow(), // top: crest │ Primăria Municipiului Roman
+                 Expanded(child: _idleBody()), // headline + dual icons
+                 _statusPill(), // bottom: gold-outlined "Terminal pregătit"
++                _diagLine(), // tiny NFC/RF diagnostic (only if present)
+               ],
+             ),
+           ),
+@@ -565,6 +572,37 @@ class _ValidatorScreenState extends State<ValidatorScreen>
+     );
+   }
+ 
++  /// Tiny diagnostic line shown under the status pill. Tap it to force a fresh
++  /// RF init and refresh the trace. Only visible on the real device (when a
++  /// diagnostic string exists and NFC hardware is expected).
++  Widget _diagLine() {
++    if (_diag.isEmpty || _diag == 'unsupported platform') {
++      return const SizedBox.shrink();
++    }
++    final good = _diag.startsWith('CARD READ') || _diag.startsWith('open ok');
++    return Padding(
++      padding: const EdgeInsets.only(top: 8),
++      child: GestureDetector(
++        onTap: () async {
++          final d = await _hw.nfcDiag();
++          if (mounted) setState(() => _diag = d);
++        },
++        child: Text(
++          'NFC: $_diag',
++          textAlign: TextAlign.center,
++          maxLines: 2,
++          overflow: TextOverflow.ellipsis,
++          style: TextStyle(
++            color: good
++                ? const Color(0xFF6FCF97)
++                : MovaColors.darkTextSecondary.withValues(alpha: 0.7),
++            fontSize: 11,
++            fontFamily: 'monospace',
++          ),
++        ),
++      ),
++    );
++  }
+ }
+ 
+ // ─────────────────────────── painters ───────────────────────────
+-- 
+2.39.5
+

@@ -1,0 +1,196 @@
+From 7473d10f90d9b88b1a47ffc4177e0f16fe3db4cd Mon Sep 17 00:00:00 2001
+From: t <t@t.com>
+Date: Tue, 7 Jul 2026 21:26:08 +0000
+Subject: [PATCH] Fix repeated RF reads via private member searchEnd() + add
+ NFC warm-up
+
+The real fix, confirmed from RFCardReaderDeviceImpl bytecode:
+- waitForCardAbsent() only reaches searchEnd() while the card is STILL
+  present; if the card was already lifted it just loops+times out WITHOUT
+  ending the search -> reader wedged after the 1st read (the persistent
+  'reads once then stops').
+- cancelRequest() throws (-4) when idle (checkNotRun needs an active wait).
+- The private *member* searchEnd() (RFCardInterface.searchEnd() +
+  throwsExceptionByErrorResult) has NO state guard and is exactly what the
+  SDK runs internally to balance searchBegin(). Call it reflectively via
+  getDeclaredMethod + setAccessible after every waitForCardPresent (success,
+  timeout, no_card). (kept by proguard -keep class com.cloudpos.**.)
+
+Also:
+- endSearchSession() now uses the member searchEnd() (falls back to the
+  static native only if the member can't be found).
+- warmUpRf()/warmUpNfc channel method: pre-open the reader + clear stale
+  search on boot so the FIRST poll no longer shows 'no open window'.
+- validator_screen calls warmUpNfc() before starting the poll loop.
+
+flutter analyze clean; APK 37.7MB (arm64).
+---
+ .../ValidatorHardwarePlugin.kt                | 91 ++++++++++++++++---
+ lib/validator_hardware.dart                   | 12 +++
+ lib/validator_screen.dart                     |  8 +-
+ 3 files changed, 96 insertions(+), 15 deletions(-)
+
+diff --git a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+index fde05a3..6a2a653 100644
+--- a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
++++ b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+@@ -140,6 +140,13 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+             }
+             "startKiosk" -> result.success(setKiosk(true))
+             "stopKiosk" -> result.success(setKiosk(false))
++            "warmUpNfc" -> io.execute {
++                // Pre-open the RF reader + clear any stale search session so the
++                // very first poll after boot doesn't hit "no open window".
++                warmUpRf()
++                val d = rfDiag
++                main.post { result.success(d) }
++            }
+             "nfcDiag" -> io.execute {
+                 // Force an open attempt so the diag reflects the real device
+                 // state (device found? opened ok?) without needing a card.
+@@ -299,30 +306,86 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     }
+ 
+     /**
+-     * Ends the native search session started by waitForCardPresent() the ONLY
+-     * correct way: the device's own waitForCardAbsent(). Its body checks
+-     * isCardPresent() and, whether the card is still there or already gone,
+-     * runs the member searchEnd() that balances the earlier searchBegin(). We
+-     * use a short timeout so a briefly-held card still lets us recover quickly.
++     * Ends the native search session started by waitForCardPresent() by calling
++     * the SDK's OWN private *member* searchEnd() reflectively.
++     *
++     * Why the member (not the static native, not waitForCardAbsent):
++     *  - RFCardReaderDeviceImpl.searchEnd() (private, no state guard) does
++     *    exactly: RFCardInterface.searchEnd() + throwsExceptionByErrorResult().
++     *    This is precisely what cancelRequest()/the absent path run internally
++     *    to balance searchBegin(). Calling it directly is the safe, quiescent
++     *    way to end the search.
++     *  - The static native RFCardInterface.searchEnd() (patch 8) skipped the
++     *    error-result handling and desynced the wrapper -> nothing scanned.
++     *  - waitForCardAbsent() only reaches searchEnd() while the card is still
++     *    present; if the card was already lifted it loops+times out WITHOUT
++     *    ending the search -> reader wedged after the 1st read. That was the
++     *    "reads once then stops" regression.
++     *  - cancelRequest() throws (-4) when idle (checkNotRun requires an active
++     *    wait), so it can't be used here either.
+      */
+     private fun endSearchSession(device: Any, cls: Class<*>) {
+         try {
+-            cls.getMethod("waitForCardAbsent", Int::class.javaPrimitiveType)
+-                .invoke(device, 800)
+-            Log.d(TAG, "RF: waitForCardAbsent ok (search ended)")
++            val m = findDeclaredMethod(cls, "searchEnd")
++            if (m != null) {
++                m.isAccessible = true
++                m.invoke(device)
++                Log.d(TAG, "RF: member searchEnd ok (search ended)")
++            } else {
++                // Fallback: the raw native searchEnd. Less ideal (no wrapper
++                // bookkeeping) but better than leaving the search open.
++                Class.forName("com.cloudpos.jniinterface.RFCardInterface")
++                    .getMethod("searchEnd").invoke(null)
++                Log.d(TAG, "RF: native searchEnd fallback ok")
++            }
+         } catch (t: Throwable) {
+-            // If this ever throws we can't trust the native state — recycle so
+-            // the next cycle reopens cleanly instead of wedging.
+-            Log.d(TAG, "RF: waitForCardAbsent note: ${t.message} -> recycling")
++            // If ending the search fails we can't trust the native state —
++            // recycle so the next cycle reopens cleanly instead of wedging.
++            Log.d(TAG, "RF: searchEnd note: ${t.message} -> recycling")
+             recycleRfDevice()
+         }
+     }
+ 
++    /**
++     * Finds a declared method by name on [cls] or any superclass (needed for
++     * the private searchEnd() on RFCardReaderDeviceImpl, which getMethod()
++     * can't see). Ignores parameter types (searchEnd is no-arg).
++     */
++    private fun findDeclaredMethod(cls: Class<*>, name: String): java.lang.reflect.Method? {
++        var c: Class<*>? = cls
++        while (c != null) {
++            try {
++                return c.getDeclaredMethod(name)
++            } catch (_: NoSuchMethodException) {
++                c = c.superclass
++            }
++        }
++        return null
++    }
++
++    /**
++     * Best-effort warm-up: open the RF singleton ahead of time and immediately
++     * end any residual search session, so the FIRST real poll after boot isn't
++     * the one that hits an uninitialised reader ("no open window"). Safe to call
++     * repeatedly; runs under rfLock on the io thread.
++     */
++    private fun warmUpRf() {
++        synchronized(rfLock) {
++            val device = ensureRfDevice() ?: return
++            val cls = rfDeviceCls ?: device.javaClass
++            // Clear any stale native search state left from a previous process
++            // instance, then leave the reader open and idle, ready to poll.
++            endSearchSession(device, cls)
++            Log.i(TAG, "RF: warm-up complete ($rfDiag)")
++        }
++    }
++
+     /**
+      * Waits up to [timeoutMs] for a single card on the cached (open) RF
+-     * singleton, reads UID + type, then ends the search session with
+-     * waitForCardAbsent() so the SAME card isn't re-reported while held and the
+-     * NEXT poll can searchBegin() again.
++     * singleton, reads UID + type, then ends the native search session via the
++     * private member searchEnd() (see endSearchSession) so the NEXT poll can
++     * searchBegin() again. Without this the reader reads exactly once and then
++     * never again.
+      *
+      * Always invoked from the background io thread (see onMethodCall), so the
+      * blocking calls never touch the UI thread — no ANR.
+diff --git a/lib/validator_hardware.dart b/lib/validator_hardware.dart
+index e460286..519baa5 100644
+--- a/lib/validator_hardware.dart
++++ b/lib/validator_hardware.dart
+@@ -125,6 +125,18 @@ class ValidatorHardware {
+     }
+   }
+ 
++  /// Pre-opens the RF reader and clears any stale native search session so the
++  /// FIRST poll after boot doesn't hit "no open window". Returns the resulting
++  /// diagnostic string. Safe to call multiple times.
++  Future<String> warmUpNfc() async {
++    if (!isSupportedPlatform) return 'unsupported platform';
++    try {
++      return (await _channel.invokeMethod<String>('warmUpNfc')) ?? '(null)';
++    } catch (e) {
++      return 'warmup error: $e';
++    }
++  }
++
+   /// Returns a human-readable trace of the last RF init/read attempt, so the
+   /// UI can show WHERE NFC fails on the real WizarPOS (device list, open error,
+   /// timeout, etc.). Empty string on unsupported platforms.
+diff --git a/lib/validator_screen.dart b/lib/validator_screen.dart
+index c25f0b1..b7b41ef 100644
+--- a/lib/validator_screen.dart
++++ b/lib/validator_screen.dart
+@@ -70,7 +70,13 @@ class _ValidatorScreenState extends State<ValidatorScreen>
+     WidgetsBinding.instance.addPostFrameCallback((_) async {
+       _caps = await _hw.capabilities();
+       await _hw.startKiosk(); // no-op unless provisioned as device owner
+-      _diag = await _hw.nfcDiag(); // surface RF init status on screen
++      // Warm up the RF reader BEFORE the first poll so the initial read doesn't
++      // hit an uninitialised reader ("no open window") on cold boot.
++      if (_caps.nfc) {
++        _diag = await _hw.warmUpNfc();
++      } else {
++        _diag = await _hw.nfcDiag();
++      }
+       if (mounted) setState(() {});
+       _startLoop();
+     });
+-- 
+2.39.5
+

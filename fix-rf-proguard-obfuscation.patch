@@ -1,0 +1,79 @@
+From 886cf30814cce8f423da537a52b2b2dd81aa5cbb Mon Sep 17 00:00:00 2001
+From: genspark_dev <genspark_dev@genspark.ai>
+Date: Tue, 7 Jul 2026 20:03:47 +0000
+Subject: [PATCH] Fix RF reader NoSuchMethodException (c.b.getInstance): R8 was
+ obfuscating/stripping the reflection-only CloudPOS SDK classes (empty SDK
+ proguard.txt). Disable minify/shrink for release + add explicit keep rules
+ for com.cloudpos.**
+
+---
+ android/app/build.gradle.kts   | 14 +++++++++++++-
+ android/app/proguard-rules.pro | 29 +++++++++++++++++++++++++++++
+ 2 files changed, 42 insertions(+), 1 deletion(-)
+ create mode 100644 android/app/proguard-rules.pro
+
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index cd2d979..ea6c17f 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -37,9 +37,21 @@ android {
+ 
+     buildTypes {
+         release {
+-            // TODO: Add your own signing config for the release build.
+             // Signing with the debug keys for now, so `flutter run --release` works.
+             signingConfig = signingConfigs.getByName("debug")
++
++            // The CloudPOS SDK is accessed entirely via reflection with the
++            // ORIGINAL class/method names, and the SDK ships an empty
++            // proguard.txt. If R8 obfuscates/strips those classes the reflective
++            // calls fail (NoSuchMethodException c.b.getInstance ...), so we
++            // disable code shrinking/obfuscation for the release build and also
++            // provide explicit keep rules as a safety net.
++            isMinifyEnabled = false
++            isShrinkResources = false
++            proguardFiles(
++                getDefaultProguardFile("proguard-android-optimize.txt"),
++                "proguard-rules.pro",
++            )
+         }
+     }
+ }
+diff --git a/android/app/proguard-rules.pro b/android/app/proguard-rules.pro
+new file mode 100644
+index 0000000..d5f270d
+--- /dev/null
++++ b/android/app/proguard-rules.pro
+@@ -0,0 +1,29 @@
++# ─────────────────────────────────────────────────────────────────────────
++# CloudPOS / WizarPOS SDK keep rules.
++#
++# The whole native bridge (ValidatorHardwarePlugin) talks to the CloudPOS SDK
++# via REFLECTION using the original, fully-qualified class + method names
++# (e.g. Class.forName("com.cloudpos.POSTerminal").getMethod("getInstance", ...)).
++# If R8/ProGuard renames or removes those classes/methods, the reflective
++# lookup throws NoSuchMethodException / ClassNotFoundException (seen on device
++# as "ensureRfDevice error: NoSuchMethodException c.b.getInstance ...").
++#
++# The SDK ships an EMPTY proguard.txt, so we must keep everything ourselves.
++# ─────────────────────────────────────────────────────────────────────────
++
++# Keep every CloudPOS class and ALL its members (fields + methods), un-renamed.
++-keep class com.cloudpos.** { *; }
++-keepnames class com.cloudpos.** { *; }
++-keep interface com.cloudpos.** { *; }
++
++# Keep the scanner AIDL stubs/interfaces used by the QR path.
++-keep class com.cloudpos.scanserver.** { *; }
++-keep class com.wizarpos.** { *; }
++
++# Do not warn about SDK internals we don't reference directly.
++-dontwarn com.cloudpos.**
++-dontwarn com.wizarpos.**
++
++# Flutter embedding (standard).
++-keep class io.flutter.** { *; }
++-dontwarn io.flutter.**
+-- 
+2.39.5
+

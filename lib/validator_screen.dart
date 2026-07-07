@@ -48,6 +48,7 @@ class _ValidatorScreenState extends State<ValidatorScreen>
   ValidatorCapabilities _caps = ValidatorCapabilities.none;
   bool _looping = false;
   bool _busy = false;
+  String _diag = ''; // last NFC/RF diagnostic trace (hidden unless present)
 
   late final AnimationController _pulse; // NFC ring pulse
   late final AnimationController _breathe; // gentle status dot
@@ -69,6 +70,13 @@ class _ValidatorScreenState extends State<ValidatorScreen>
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       _caps = await _hw.capabilities();
       await _hw.startKiosk(); // no-op unless provisioned as device owner
+      // Warm up the RF reader BEFORE the first poll so the initial read doesn't
+      // hit an uninitialised reader ("no open window") on cold boot.
+      if (_caps.nfc) {
+        _diag = await _hw.warmUpNfc();
+      } else {
+        _diag = await _hw.nfcDiag();
+      }
       if (mounted) setState(() {});
       _startLoop();
     });
@@ -121,11 +129,19 @@ class _ValidatorScreenState extends State<ValidatorScreen>
           );
           continue;
         }
+        // Refresh the on-screen diagnostic so we can see why RF isn't firing
+        // (device list / open error / timeout) without needing adb logcat.
+        final d = await _hw.nfcDiag();
+        if (mounted && d != _diag) setState(() => _diag = d);
       }
 
       // If no hardware at all (web / normal phone), idle politely.
       if (!_caps.nfc && !_caps.scanner) {
         await Future.delayed(const Duration(milliseconds: 600));
+      } else {
+        // Small breather between cycles: lets the UI thread render the
+        // idle animations smoothly and keeps CPU/heat low on the 24/7 device.
+        await Future.delayed(const Duration(milliseconds: 120));
       }
     }
   }
@@ -289,6 +305,7 @@ class _ValidatorScreenState extends State<ValidatorScreen>
                 _brandRow(), // top: crest │ Primăria Municipiului Roman
                 Expanded(child: _idleBody()), // headline + dual icons
                 _statusPill(), // bottom: gold-outlined "Terminal pregătit"
+                _diagLine(), // tiny NFC/RF diagnostic (only if present)
               ],
             ),
           ),
@@ -561,6 +578,37 @@ class _ValidatorScreenState extends State<ValidatorScreen>
     );
   }
 
+  /// Tiny diagnostic line shown under the status pill. Tap it to force a fresh
+  /// RF init and refresh the trace. Only visible on the real device (when a
+  /// diagnostic string exists and NFC hardware is expected).
+  Widget _diagLine() {
+    if (_diag.isEmpty || _diag == 'unsupported platform') {
+      return const SizedBox.shrink();
+    }
+    final good = _diag.startsWith('CARD READ') || _diag.startsWith('open ok');
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: GestureDetector(
+        onTap: () async {
+          final d = await _hw.nfcDiag();
+          if (mounted) setState(() => _diag = d);
+        },
+        child: Text(
+          'NFC: $_diag',
+          textAlign: TextAlign.center,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: good
+                ? const Color(0xFF6FCF97)
+                : MovaColors.darkTextSecondary.withValues(alpha: 0.7),
+            fontSize: 11,
+            fontFamily: 'monospace',
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 // ─────────────────────────── painters ───────────────────────────

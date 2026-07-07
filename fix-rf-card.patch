@@ -1,0 +1,214 @@
+From 242dda9c4bb473476cae7221a71116253ba5ed3a Mon Sep 17 00:00:00 2001
+From: genspark_dev <genspark_dev@genspark.ai>
+Date: Tue, 7 Jul 2026 19:29:03 +0000
+Subject: [PATCH] =?UTF-8?q?RF=20card=20reader:=20open=20device=20once=20(r?=
+ =?UTF-8?q?euse),=20wait-for-card-absent=20so=20same=20card=20isn't=20re-r?=
+ =?UTF-8?q?ead,=20release=20on=20detach=20=E2=80=94=20reliable=20card=20de?=
+ =?UTF-8?q?tection=20+=20alert?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../ValidatorHardwarePlugin.kt                | 152 ++++++++++++++----
+ 1 file changed, 117 insertions(+), 35 deletions(-)
+
+diff --git a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+index e2d759c..30998a3 100644
+--- a/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
++++ b/android/app/src/main/kotlin/com/transurban/transurban_validator/ValidatorHardwarePlugin.kt
+@@ -77,6 +77,18 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     @Volatile private var scanService: IScanService? = null
+     @Volatile private var scanBound = false
+ 
++    // ---- Persistent RF card reader (opened ONCE, reused for every read) ----
++    // Opening/closing the RF device on every ~2.5s poll is expensive, can leave
++    // the device in a "busy"/half-open state and makes card detection unreliable
++    // (sometimes it just never fires). We now open the reader a single time and
++    // reuse the same handle for every waitForCardPresent() cycle. After a
++    // successful read we wait for the card to leave the field so the SAME card
++    // isn't reported over and over while the user holds it there.
++    private val rfLock = Object()
++    @Volatile private var rfDevice: Any? = null
++    @Volatile private var rfDeviceCls: Class<*>? = null
++    @Volatile private var lastUid: String? = null
++
+     // ---- FlutterPlugin ----
+     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+         appContext = binding.applicationContext
+@@ -88,8 +100,9 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+         channel?.setMethodCallHandler(null)
+         channel = null
+-        // Release the shared scanner connection so we never leak it.
++        // Release shared hardware handles so we never leak them.
+         releaseScannerService()
++        releaseRfDevice()
+         io.shutdownNow()
+     }
+ 
+@@ -147,37 +160,85 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+     // -------------------- NFC / contactless (reflection) --------------------
+ 
+     /**
+-     * Opens the RF reader, waits up to [timeoutMs] for a single card, reads its
+-     * UID, then closes. Mirrors BusPassDemo's CycleWaitThread but for one shot.
+-     * All SDK access via reflection so the module never hard-depends on the AAR.
++     * Lazily opens the CloudPOS RF card reader ONCE and caches the device
++     * handle + class. Opening is done from the background io thread. On every
++     * subsequent read we reuse the same open device (no open/close churn).
++     * Returns null if the SDK / device is unavailable.
+      */
+-    private fun readNfcOnce(timeoutMs: Int): Map<String, Any?> {
+-        val ctx = appContext ?: return fail("no_context")
+-        var device: Any? = null
+-        return try {
+-            val posTerminalCls = Class.forName("com.cloudpos.POSTerminal")
+-            val getInstance = posTerminalCls.getMethod("getInstance", Context::class.java)
+-            val terminal = getInstance.invoke(null, ctx)
+-            val getDevice = posTerminalCls.getMethod("getDevice", String::class.java)
+-            device = getDevice.invoke(terminal, RF_DEVICE_NAME)
+-                ?: return fail("no_device")
+-
+-            val deviceCls = device.javaClass
+-            // open()  (no-arg form, as used in the working demo)
++    private fun ensureRfDevice(): Any? {
++        rfDevice?.let { return it }
++        val ctx = appContext ?: return null
++        synchronized(rfLock) {
++            rfDevice?.let { return it }
+             try {
+-                deviceCls.getMethod("open").invoke(device)
+-            } catch (_: NoSuchMethodException) {
+-                // fall back to open(int, int) with logicalID 0 + MODE_AUTO(0)
+-                deviceCls.getMethod("open", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+-                    .invoke(device, 0, 0)
++                val posTerminalCls = Class.forName("com.cloudpos.POSTerminal")
++                val getInstance = posTerminalCls.getMethod("getInstance", Context::class.java)
++                val terminal = getInstance.invoke(null, ctx)
++                val getDevice = posTerminalCls.getMethod("getDevice", String::class.java)
++                val device = getDevice.invoke(terminal, RF_DEVICE_NAME) ?: return null
++                val deviceCls = device.javaClass
++
++                // open() — no-arg form used by the working BusPassDemo; fall back
++                // to open(int,int). If it's already open from a previous run the
++                // SDK may throw DeviceException(-2) — treat that as "already open".
++                try {
++                    deviceCls.getMethod("open").invoke(device)
++                } catch (e: java.lang.reflect.InvocationTargetException) {
++                    // Already-open / benign open failure: keep the handle anyway.
++                    Log.d(TAG, "rf open() note: ${e.targetException?.message}")
++                } catch (_: NoSuchMethodException) {
++                    try {
++                        deviceCls.getMethod(
++                            "open",
++                            Int::class.javaPrimitiveType,
++                            Int::class.javaPrimitiveType
++                        ).invoke(device, 0, 0)
++                    } catch (e: java.lang.reflect.InvocationTargetException) {
++                        Log.d(TAG, "rf open(0,0) note: ${e.targetException?.message}")
++                    }
++                }
++
++                // SDK 1.8.2.24 optimizations (best-effort, ignored if absent):
++                // skipRATS() = faster UID-only reads; low-power detect for 24/7 use.
++                invokeOptional(device, deviceCls, "skipRATS")
++                invokeOptional(device, deviceCls, "enableLowPowerCardDetect")
++
++                rfDevice = device
++                rfDeviceCls = deviceCls
++                return device
++            } catch (t: Throwable) {
++                Log.w(TAG, "ensureRfDevice failed: ${t.message}")
++                return null
+             }
++        }
++    }
+ 
+-            // --- SDK 1.8.2.24 optimizations (all best-effort, ignored if absent) ---
+-            // skipRATS(): avoid entering ISO14443-4, faster UID-only reads for transit.
+-            invokeOptional(device, deviceCls, "skipRATS")
+-            // enableLowPowerCardDetect(): the validator is mounted 24/7, save power.
+-            invokeOptional(device, deviceCls, "enableLowPowerCardDetect")
++    /** Closes and clears the cached RF device (on error / lifecycle end). */
++    private fun releaseRfDevice() {
++        synchronized(rfLock) {
++            val device = rfDevice
++            if (device != null) {
++                invokeOptional(device, device.javaClass, "disableLowPowerCardDetect")
++                try { device.javaClass.getMethod("close").invoke(device) } catch (_: Throwable) {}
++            }
++            rfDevice = null
++            rfDeviceCls = null
++            lastUid = null
++        }
++    }
+ 
++    /**
++     * Waits up to [timeoutMs] for a single card on the SHARED (already-open) RF
++     * reader, reads its UID + type, then waits for the card to leave the field
++     * so the same card isn't reported repeatedly while held there.
++     *
++     * Always invoked from the background io thread (see onMethodCall), so the
++     * blocking waitForCardPresent() never touches the UI thread.
++     */
++    private fun readNfcOnce(timeoutMs: Int): Map<String, Any?> {
++        val device = ensureRfDevice() ?: return fail("unavailable")
++        val deviceCls = rfDeviceCls ?: device.javaClass
++        return try {
+             val waitForCardPresent = deviceCls.getMethod(
+                 "waitForCardPresent", Int::class.javaPrimitiveType
+             )
+@@ -192,20 +253,41 @@ class ValidatorHardwarePlugin : FlutterPlugin, ActivityAware, MethodChannel.Meth
+                 ?: return fail("no_card")
+             val idBytes = card.javaClass.getMethod("getID").invoke(card) as? ByteArray
+             val uid = idBytes?.joinToString("") { "%02X".format(it) } ?: ""
++            if (uid.isEmpty()) return fail("no_uid")
+ 
+-            // getCardTypeValue(): int[] describing detected card technology (1.7.7+).
++            // getCardTypeValue(): int[] describing detected card technology.
+             val cardType = readCardType(device, deviceCls)
+ 
+-            mapOf("ok" to uid.isNotEmpty(), "uid" to uid, "cardType" to cardType)
++            // Wait for the card to be removed so the loop doesn't fire the same
++            // UID on the very next cycle while the user keeps holding it.
++            waitForCardAbsent(device, deviceCls)
++            lastUid = uid
++
++            mapOf("ok" to true, "uid" to uid, "cardType" to cardType)
+         } catch (t: Throwable) {
+             Log.w(TAG, "readNfcOnce failed: ${t.message}")
++            // A hard failure may mean the device handle went stale — drop it so
++            // the next read reopens cleanly.
++            releaseRfDevice()
+             fail(if (t is ClassNotFoundException) "unavailable" else "error")
+-        } finally {
+-            if (device != null) {
+-                // Revert low-power mode then close, both best-effort.
+-                invokeOptional(device, device.javaClass, "disableLowPowerCardDetect")
+-                try { device.javaClass.getMethod("close").invoke(device) } catch (_: Throwable) {}
+-            }
++        }
++    }
++
++    /**
++     * Best-effort wait for the card to leave the RF field, capped so we never
++     * block the poll loop for long. Tries waitForCardAbsent(int) then
++     * removeCard(); ignored if neither exists in this SDK build.
++     */
++    private fun waitForCardAbsent(device: Any, cls: Class<*>) {
++        try {
++            cls.getMethod("waitForCardAbsent", Int::class.javaPrimitiveType)
++                .invoke(device, 1500)
++            return
++        } catch (_: Throwable) { /* try next */ }
++        try {
++            cls.getMethod("removeCard").invoke(device)
++        } catch (_: Throwable) { /* fine — just add a small settle delay */
++            try { Thread.sleep(400) } catch (_: InterruptedException) {}
+         }
+     }
+ 
+-- 
+2.39.5
+

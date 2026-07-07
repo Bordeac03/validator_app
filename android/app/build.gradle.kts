@@ -37,9 +37,21 @@ android {
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+
+            // The CloudPOS SDK is accessed entirely via reflection with the
+            // ORIGINAL class/method names, and the SDK ships an empty
+            // proguard.txt. If R8 obfuscates/strips those classes the reflective
+            // calls fail (NoSuchMethodException c.b.getInstance ...), so we
+            // disable code shrinking/obfuscation for the release build and also
+            // provide explicit keep rules as a safety net.
+            isMinifyEnabled = false
+            isShrinkResources = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }
